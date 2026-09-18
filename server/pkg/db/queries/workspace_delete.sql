@@ -355,6 +355,13 @@ deleted_issue_dependencies AS (
     WHERE issue_id IN (SELECT id FROM ws_issues)
        OR depends_on_issue_id IN (SELECT id FROM ws_issues)
 ),
+deleted_pipeline_templates AS (
+    DELETE FROM pipeline_template WHERE workspace_id = $1
+),
+deleted_pipeline_template_stages AS (
+    DELETE FROM pipeline_template_stage
+    WHERE template_id IN (SELECT id FROM deleted_pipeline_templates)
+),
 deleted_issue_subscribers AS (
     DELETE FROM issue_subscriber
     WHERE issue_id IN (SELECT id FROM ws_issues)

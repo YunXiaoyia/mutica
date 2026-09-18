@@ -2021,6 +2021,19 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				})
 			})
 
+			// Pipeline templates + runs (WP-2, docs/aris-paper-pipeline.md)
+			r.Route("/api/pipeline-templates", func(r chi.Router) {
+				r.Get("/", h.ListPipelineTemplates)
+				r.Post("/", h.CreatePipelineTemplate)
+				r.Route("/{id}", func(r chi.Router) {
+					r.Get("/", h.GetPipelineTemplate)
+					r.Put("/", h.UpdatePipelineTemplate)
+					r.Delete("/", h.DeletePipelineTemplate)
+					r.Post("/instantiate", h.InstantiatePipelineTemplate)
+				})
+			})
+			r.Post("/api/pipeline-runs/{rootId}/advance", h.AdvancePipelineRun)
+
 			// Squad leader evaluation (writes to activity_log)
 			r.Post("/api/issues/{id}/squad-evaluated", h.RecordSquadLeaderEvaluation)
 

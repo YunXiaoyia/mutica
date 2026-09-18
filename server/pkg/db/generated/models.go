@@ -1093,6 +1093,32 @@ type PinnedItem struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type PipelineTemplate struct {
+	ID                  pgtype.UUID        `json:"id"`
+	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
+	Name                string             `json:"name"`
+	Version             int32              `json:"version"`
+	Description         string             `json:"description"`
+	OrchestratorAgentID pgtype.UUID        `json:"orchestrator_agent_id"`
+	CreatedBy           pgtype.UUID        `json:"created_by"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PipelineTemplateStage struct {
+	ID                 pgtype.UUID        `json:"id"`
+	TemplateID         pgtype.UUID        `json:"template_id"`
+	StageOrder         int32              `json:"stage_order"`
+	Name               string             `json:"name"`
+	AgentID            pgtype.UUID        `json:"agent_id"`
+	SkillIds           []pgtype.UUID      `json:"skill_ids"`
+	PromptTemplate     string             `json:"prompt_template"`
+	AcceptanceCriteria string             `json:"acceptance_criteria"`
+	AdvanceMode        string             `json:"advance_mode"`
+	RequiresHumanGate  bool               `json:"requires_human_gate"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+}
+
 type PluginHookSchedule struct {
 	ID             pgtype.UUID        `json:"id"`
 	InstallationID pgtype.UUID        `json:"installation_id"`
