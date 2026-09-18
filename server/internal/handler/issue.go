@@ -3777,6 +3777,11 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	// fails best-effort.
 	if statusChanged {
 		h.notifyParentOfChildDone(r.Context(), prevIssue, issue)
+		// Dependency release (WP-1, docs/aris-paper-pipeline.md): a terminal
+		// blocker unblocks its dependents. Same guard pattern as the parent
+		// notification — the transition check and per-dependent guards live
+		// inside the helper; best-effort, never fails the status write.
+		h.notifyDependentsOfTerminal(r.Context(), prevIssue, issue)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -4239,6 +4244,10 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	// the parent/stage notification is evaluated once against the final state
 	// after the loop (MUL-4155) rather than per-child mid-batch.
 	var childDoneCompleted []db.Issue
+	// Blockers that reached a terminal status in this batch, for the deferred
+	// dependency release (WP-1). Independent of childDoneCompleted: dependency
+	// edges do not require a parent link.
+	var terminalBlockers []db.Issue
 	for _, issueID := range req.IssueIDs {
 		issueUUID, err := util.ParseUUID(issueID)
 		if err != nil {
@@ -4473,13 +4482,20 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		// done/cancelled status still enters the stage barrier below. A literal
 		// comparison here left childDoneCompleted empty and silently skipped
 		// notifyParentsOfBatchChildDone entirely. (MUL-6243)
-		if statusChanged && issue.ParentIssueID.Valid {
+		if statusChanged {
 			prevTerminal := isTerminalChildStatus(
 				issuestatus.Effective(r.Context(), h.Queries, prevIssue.WorkspaceID, prevIssue.Status))
 			nowTerminal := isTerminalChildStatus(
 				issuestatus.Effective(r.Context(), h.Queries, issue.WorkspaceID, issue.Status))
 			if !prevTerminal && nowTerminal {
-				childDoneCompleted = append(childDoneCompleted, issue)
+				if issue.ParentIssueID.Valid {
+					childDoneCompleted = append(childDoneCompleted, issue)
+				}
+				// Dependency release shares the same deferred aggregation: a
+				// blocker that reached a terminal status in this batch releases
+				// its dependents once, against the final committed state
+				// (WP-1, docs/aris-paper-pipeline.md).
+				terminalBlockers = append(terminalBlockers, issue)
 			}
 		}
 
@@ -4491,6 +4507,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	// of issue_ids order (MUL-4155). Best-effort; failure does not abort the
 	// batch. Single-issue UpdateIssue is unchanged and still notifies inline.
 	h.notifyParentsOfBatchChildDone(r.Context(), childDoneCompleted)
+	h.notifyDependentsOfBatchTerminal(r.Context(), terminalBlockers)
 
 	slog.Info("batch update issues", append(logger.RequestAttrs(r), "count", updated)...)
 	writeJSON(w, http.StatusOK, map[string]any{"updated": updated})

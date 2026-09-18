@@ -142,6 +142,19 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 		return IssueRunTrigger{}, false
 	}
 
+	// Dependency gate (WP-1, docs/aris-paper-pipeline.md). An issue whose
+	// blocked_by dependencies are not all terminal is held like a backlog
+	// park: the write itself succeeds, but no run starts. Release is
+	// server-driven — when the last blocker reaches a terminal status (or its
+	// edge is removed) the handler posts a system comment on this issue and
+	// enqueues its assignee through the mention path, which is deliberately
+	// independent of this predicate. Preview shares the check so it never
+	// promises a run the gate would withhold. Creates are exempt: a
+	// brand-new issue cannot carry dependency edges yet.
+	if !in.IsCreate && s.hasUnresolvedBlockers(ctx, issue) {
+		return IssueRunTrigger{}, false
+	}
+
 	switch issue.AssigneeType.String {
 	case "agent":
 		agent, err := s.Queries.GetAgent(ctx, issue.AssigneeID)
@@ -201,6 +214,34 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 		}, true
 	}
 	return IssueRunTrigger{}, false
+}
+
+// hasUnresolvedBlockers reports whether the issue carries a blocked_by edge
+// whose blocker has not reached a terminal status. Like backlog parking and
+// the triage guard, a held issue yields no trigger; unlike triage there is no
+// distinct reason code because the outcome surfaces through the release
+// comment when the last blocker resolves. Errors fail closed to "blocked" so
+// the write path never enqueues against a partially known dependency set and
+// preview never over-promises a run.
+func (s *IssueService) hasUnresolvedBlockers(ctx context.Context, issue db.Issue) bool {
+	hasEdge, err := s.Queries.HasBlockedByEdge(ctx, issue.ID)
+	if err != nil || !hasEdge {
+		return err != nil
+	}
+	blockers, err := s.Queries.ListBlockerIssues(ctx, issue.ID)
+	if err != nil {
+		return true
+	}
+	for _, blocker := range blockers {
+		// Resolve each blocker through the workspace status catalog so custom
+		// statuses in the done/cancelled categories release work exactly like
+		// the built-in terminal keys (MUL-6243 semantics).
+		status := issuestatus.Effective(ctx, s.Queries, issue.WorkspaceID, blocker.Status)
+		if status != "done" && status != "cancelled" {
+			return true
+		}
+	}
+	return false
 }
 
 // hasPendingRun reports whether the agent already holds a queued or dispatched

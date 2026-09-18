@@ -1941,6 +1941,10 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 	// notifyParentOfChildDone re-checks every guard (prev != done, parent
 	// exists, parent not terminal), so calling it unconditionally is safe.
 	h.notifyParentOfChildDone(ctx, issue, updated)
+	// A merged PR is also a common way a dependency blocker reaches done —
+	// release its dependents on the same transition (WP-1,
+	// docs/aris-paper-pipeline.md). The helper re-checks the transition guard.
+	h.notifyDependentsOfTerminal(ctx, issue, updated)
 
 	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
 	resp := issueToResponse(updated, prefix)
