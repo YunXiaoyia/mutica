@@ -1,0 +1,48 @@
+---
+title: How Multica works
+description: Multica records and coordinates the work; connected computers execute it.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+When you assign an issue to an agent, Multica creates a run that a runtime on a connected computer claims. The runtime invokes a local AI coding tool and writes progress and results back to the original issue.
+
+## The full path of a run
+
+![Diagram of a run: on the left, the Multica area records and schedules — an issue triggers the creation of a run; on the right, in the "your computer" area, the daemon claims the run, launches the AI coding tool, and reads and writes the working directory; progress messages stream back to the execution log in real time, and the daemon writes the final result back to the issue](/images/docs/how-a-run-works.webp)
+
+1. **The issue provides the context.** The issue holds the work description, the discussion, and the assignee. When it is assigned to an agent, the system uses that agent's instructions, model, skills, and runtime configuration.
+2. **Multica creates a run.** The run enters the queue; if no runtime is online, it waits there.
+3. **A runtime claims the run.** An online runtime on a connected computer claims the run and invokes the AI coding tool the agent is configured to use.
+4. **The AI coding tool executes locally.** The tool reads the working directory, runs commands, and produces results.
+5. **Results are written back to the issue.** Progress, comments, and results appear in the issue's timeline and execution log.
+
+For the full list of issues, agents, runs, and runtimes and how they relate, see [Core concepts](/concepts).
+
+## The data and execution boundary
+
+| Multica | Connected computer |
+|---|---|
+| Workspaces, issues, comments, and statuses | AI coding tools and their credentials |
+| Agent configuration and skills | Code directories and local files |
+| Run status, records, and results | Actual file changes and command execution |
+
+This boundary is the same on Multica Cloud and in self-hosted deployments.
+
+<Callout type="warning">
+One exception: anything saved to an agent's `custom_env` is stored on the Multica server and passed to the runtime at execution time. Do not put secrets in `custom_env` that must never leave your computer.
+</Callout>
+
+## How agents are triggered
+
+Agents never start work on their own — every run is triggered by an explicit action: assigning an issue, @-mentioning the agent in a comment, chatting with it directly, or an Autopilot. For how to choose between the four and the rules they share, see [Put agents to work](/triggering-agents).
+
+## Run completion and issue completion
+
+When the execution log shows Completed, it only means that one run has ended. The issue can still take further discussion, added requirements, or another agent trigger. Whether the issue is done depends on the actual progress of the work and its status.
+
+## Next steps
+
+- [Daemon and runtimes](/daemon-runtimes) — how computers connect to Multica, and what happens when runtimes go online or offline.
+- [Runs](/tasks) — run statuses, retries, and cancellation rules.
+- [Assign issues to agents](/assigning-issues) — the most common way to collaborate.

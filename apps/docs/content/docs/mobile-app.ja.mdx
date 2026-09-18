@@ -1,0 +1,94 @@
+---
+title: モバイルアプリ (iOS)
+description: ソースコードから Multica を iPhone にインストールし、Cloud またはセルフホストインスタンスに接続します。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica の iOS クライアントはまだ App Store にありません。Mac でオープンソースリポジトリから Release 版をビルドし、自分の iPhone にインストールできます。Android クライアントはまだ提供されていません。
+
+インストールしたアプリはデフォルトで Multica Cloud に接続し、既存のアカウントでそのままサインインできます。ワークスペース、タスク、コメント、実行履歴はすべてサーバー側に保存されるため、Web や Desktop から手動で同期する必要はありません。
+
+## 事前準備
+
+必要なもの:
+
+- Xcode をインストールした Mac。
+- **Xcode → Settings → Accounts** でサインイン済みの Apple ID。
+- USB で接続した iPhone。
+- iPhone の **設定 → プライバシーとセキュリティ** でデベロッパモードを有効にしておくこと。
+- Node.js、pnpm、Git。
+
+Xcode や実機の開発環境がまだ設定されていない場合は、先に Expo の [iOS デバイスの環境セットアップ](https://docs.expo.dev/get-started/set-up-your-environment/)を完了してください。
+
+## iPhone へのインストール
+
+リポジトリをクローンして依存関係をインストールします:
+
+```bash
+git clone https://github.com/multica-ai/multica.git
+cd multica
+pnpm install
+```
+
+続いてリポジトリのルートから実行します:
+
+```bash
+pnpm ios:mobile:device:prod:release
+```
+
+これは Metro に依存しない Release 版をビルドし、接続中の iPhone にインストールします。初回ビルドは iOS の依存関係をダウンロードして React Native をコンパイルするため時間がかかりますが、以降は Xcode のキャッシュを再利用します。
+
+iPhone がアプリの起動をブロックする場合は、**設定 → 一般 → VPN とデバイス管理** で対応する開発者証明書を信頼してください。
+
+## 無料署名の 7 日制限
+
+無料の Apple ID で署名したアプリは 7 日間しか使えません。期限が切れたら、iPhone を Mac に接続し直し、同じビルドコマンドをもう一度実行すれば再署名できます。
+
+Apple Developer Program アカウントで署名すると有効期間が長くなり、TestFlight や正式な配布にも使えます。どちらの署名でも、再インストールや再署名によってサーバー側のデータが失われることはありません。
+
+## 署名の失敗
+
+Xcode が `No matching provisioning profiles found` と報告する場合、デフォルトの bundle identifier があなたの Apple ID に属していない可能性があります。自分が管理する逆ドメイン名に切り替えて再ビルドしてください:
+
+```bash
+export EXPO_BUNDLE_IDENTIFIER_PROD=com.yourname.multica
+pnpm ios:mobile:device:prod:release
+```
+
+この値はあなたの Apple Developer team で利用できれば十分で、Multica のアカウントやワークスペースには影響しません。
+
+## 更新
+
+自分でインストールした iOS ビルドは自動更新されません。最新のコードを取得し、依存関係を更新して再ビルドします:
+
+```bash
+git pull --ff-only
+pnpm install
+pnpm ios:mobile:device:prod:release
+```
+
+## セルフホストインスタンスへの接続
+
+Release ビルドは API アドレスをアプリに埋め込みます。セルフホストインスタンスに接続するには、先に `apps/mobile/.env.production` を編集します:
+
+```dotenv
+EXPO_PUBLIC_API_URL=https://api.example.com
+EXPO_PUBLIC_WEB_URL=https://app.example.com
+```
+
+`EXPO_PUBLIC_API_URL` は必須です。`EXPO_PUBLIC_WEB_URL` は任意で、"Copy link" や "Open on web" などの入口に使われます。未設定の場合、これらのメニュー項目は表示されません。
+
+編集後にビルドコマンドを再実行します。iPhone がこの API アドレスに到達できる必要があります。LAN のアドレスを使う場合、`localhost` と書かないでください — iPhone 上では iPhone 自身を指します。
+
+<Callout type="warning">
+`.env.production` を変更すると、現在のチェックアウトの本番設定が変わります。その変更をコミットすると、個人の API アドレスがリポジトリの本番設定に書き込まれます。
+</Callout>
+
+モバイルの開発、Simulator の使用、staging への接続については、リポジトリの [`apps/mobile/README.md`](https://github.com/multica-ai/multica/blob/main/apps/mobile/README.md) を参照してください。
+
+## 次のステップ
+
+- [クイックスタート](/cloud-quickstart) — 初回の実行を完了する。
+- [デスクトップアプリ](/desktop-app) — デスクトップタブと内蔵デーモン。
+- [トラブルシューティング](/troubleshooting) — 接続と実行の問題の診断。

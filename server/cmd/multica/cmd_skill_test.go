@@ -1,0 +1,791 @@
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+)
+
+func newSkillImportTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "import"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("url", "", "")
+	cmd.Flags().String("on-conflict", "fail", "")
+	cmd.Flags().String("output", "json", "")
+	return cmd
+}
+
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+
+	// Read while fn runs. A pipe nobody is draining stops accepting writes long
+	// before a command's output ends -- after 512 bytes on macOS -- so reading
+	// only once fn has returned deadlocks on anything that prints more.
+	type captured struct {
+		out []byte
+		err error
+	}
+	drained := make(chan captured, 1)
+	go func() {
+		out, err := io.ReadAll(r)
+		drained <- captured{out, err}
+	}()
+
+	runErr := fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	got := <-drained
+	if got.err != nil {
+		t.Fatalf("read stdout: %v", got.err)
+	}
+	return string(got.out), runErr
+}
+
+func TestRunSkillImportJsonTreatsDuplicateAsConflictResult(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-123")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/skills/import" {
+			t.Fatalf("path = %q, want /api/skills/import", r.URL.Path)
+		}
+		if r.Header.Get("X-Workspace-ID") != "workspace-123" {
+			t.Fatalf("X-Workspace-ID = %q, want workspace-123", r.Header.Get("X-Workspace-ID"))
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if body["url"] != "https://skills.sh/acme/review-helper" {
+			t.Fatalf("url = %v", body["url"])
+		}
+		if body["on_conflict"] != "fail" {
+			t.Fatalf("on_conflict = %v, want fail", body["on_conflict"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "conflict",
+			"reason": "a skill with this name already exists; use --on-conflict overwrite to replace it or --on-conflict rename to import a copy",
+			"existing_skill": map[string]any{
+				"id":   "skill-123",
+				"name": "review-helper",
+			},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	cmd := newSkillImportTestCmd()
+	_ = cmd.Flags().Set("url", "https://skills.sh/acme/review-helper")
+	_ = cmd.Flags().Set("output", "json")
+
+	out, err := captureStdout(t, func() error {
+		return runSkillImport(cmd, nil)
+	})
+	if err == nil {
+		t.Fatal("expected duplicate import to return an error")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode stdout JSON %q: %v", out, err)
+	}
+	if got["status"] != "conflict" {
+		t.Fatalf("status = %v", got["status"])
+	}
+	if !strings.Contains(strVal(got, "reason"), "--on-conflict overwrite") {
+		t.Fatalf("reason = %v", got["reason"])
+	}
+	existing, ok := got["existing_skill"].(map[string]any)
+	if !ok {
+		t.Fatalf("existing_skill missing or wrong type: %#v", got["existing_skill"])
+	}
+	if existing["id"] != "skill-123" || existing["name"] != "review-helper" {
+		t.Fatalf("existing_skill = %#v", existing)
+	}
+}
+
+func TestRunSkillImportSendsOnConflictAndPrintsStructuredResult(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-123")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if body["on_conflict"] != "overwrite" {
+			t.Fatalf("on_conflict = %v, want overwrite", body["on_conflict"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "updated",
+			"skill": map[string]any{
+				"id":   "skill-123",
+				"name": "review-helper",
+			},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	cmd := newSkillImportTestCmd()
+	_ = cmd.Flags().Set("url", "https://skills.sh/acme/review-helper")
+	_ = cmd.Flags().Set("on-conflict", "overwrite")
+	_ = cmd.Flags().Set("output", "json")
+
+	out, err := captureStdout(t, func() error {
+		return runSkillImport(cmd, nil)
+	})
+	if err != nil {
+		t.Fatalf("runSkillImport returned error: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode stdout JSON %q: %v", out, err)
+	}
+	if got["status"] != "updated" {
+		t.Fatalf("status = %v", got["status"])
+	}
+}
+
+func TestRunSkillSearchRequestsSearchEndpoint(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.String()
+		if r.URL.Path != "/api/skills/search" {
+			t.Fatalf("expected /api/skills/search, got %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("q") != "react hooks" {
+			t.Fatalf("expected q=react hooks, got %q", r.URL.Query().Get("q"))
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"name":          "React",
+				"url":           "https://clawhub.ai/ivangdavila/react",
+				"source":        "clawhub.ai",
+				"repo":          nil,
+				"install_count": 62,
+				"github_stars":  nil,
+				"description":   "React engineering skill",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := &cobra.Command{Use: "search"}
+	cmd.Flags().String("output", "json", "")
+	cmd.Flags().String("profile", "", "")
+	if err := runSkillSearch(cmd, []string{"react hooks"}); err != nil {
+		t.Fatalf("runSkillSearch: %v", err)
+	}
+	if gotPath == "" {
+		t.Fatal("expected search endpoint to be requested")
+	}
+}
+
+func newSkillCreateTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "create"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().String("description", "", "")
+	cmd.Flags().String("content", "", "")
+	cmd.Flags().Bool("content-stdin", false, "")
+	cmd.Flags().String("content-file", "", "")
+	cmd.Flags().String("config", "", "")
+	cmd.Flags().String("output", "json", "")
+	return cmd
+}
+
+func newSkillUpdateTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "update"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("name", "", "")
+	cmd.Flags().String("description", "", "")
+	cmd.Flags().String("content", "", "")
+	cmd.Flags().Bool("content-stdin", false, "")
+	cmd.Flags().String("content-file", "", "")
+	cmd.Flags().String("config", "", "")
+	cmd.Flags().String("output", "json", "")
+	return cmd
+}
+
+func newSkillFilesUpsertTestCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "upsert"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("path", "", "")
+	cmd.Flags().String("content", "", "")
+	cmd.Flags().Bool("content-stdin", false, "")
+	cmd.Flags().String("content-file", "", "")
+	cmd.Flags().String("output", "json", "")
+	return cmd
+}
+
+func newSkillBodyCaptureServer(t *testing.T, wantMethod, wantPath string, body *map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != wantMethod {
+			t.Fatalf("method = %s, want %s", r.Method, wantMethod)
+		}
+		if r.URL.Path != wantPath {
+			t.Fatalf("path = %q, want %q", r.URL.Path, wantPath)
+		}
+		if err := json.NewDecoder(r.Body).Decode(body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":          "skill-123",
+			"name":        "skill-name",
+			"path":        "docs/SKILL.md",
+			"description": "desc",
+			"content":     (*body)["content"],
+		})
+	}))
+}
+
+func setSkillServerEnv(t *testing.T, serverURL string) {
+	t.Helper()
+	t.Setenv("MULTICA_SERVER_URL", serverURL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+}
+
+func TestRunSkillCreateReadsContentFileVerbatim(t *testing.T) {
+	var body map[string]any
+	srv := newSkillBodyCaptureServer(t, http.MethodPost, "/api/skills", &body)
+	defer srv.Close()
+	setSkillServerEnv(t, srv.URL)
+
+	content := "标题 / Заголовок\n\nBody with `code`, \"quotes\", and a literal \\n.\n"
+	path := t.TempDir() + string(os.PathSeparator) + "SKILL.md"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write skill file: %v", err)
+	}
+
+	cmd := newSkillCreateTestCmd()
+	_ = cmd.Flags().Set("name", "skill-name")
+	_ = cmd.Flags().Set("content-file", path)
+	if _, err := captureStdout(t, func() error { return runSkillCreate(cmd, nil) }); err != nil {
+		t.Fatalf("runSkillCreate: %v", err)
+	}
+	if body["content"] != content {
+		t.Fatalf("content = %q, want verbatim %q", body["content"], content)
+	}
+}
+
+func TestRunSkillCreateKeepsInlineContentLiteral(t *testing.T) {
+	var body map[string]any
+	srv := newSkillBodyCaptureServer(t, http.MethodPost, "/api/skills", &body)
+	defer srv.Close()
+	setSkillServerEnv(t, srv.URL)
+
+	content := `regex \d and path C:\\new and literal \n done`
+	cmd := newSkillCreateTestCmd()
+	_ = cmd.Flags().Set("name", "skill-name")
+	_ = cmd.Flags().Set("content", content)
+	if _, err := captureStdout(t, func() error { return runSkillCreate(cmd, nil) }); err != nil {
+		t.Fatalf("runSkillCreate: %v", err)
+	}
+	if body["content"] != content {
+		t.Fatalf("content = %q, want literal inline %q", body["content"], content)
+	}
+}
+
+func TestRunSkillUpdateReadsContentStdinVerbatim(t *testing.T) {
+	var body map[string]any
+	srv := newSkillBodyCaptureServer(t, http.MethodPut, "/api/skills/skill-123", &body)
+	defer srv.Close()
+	setSkillServerEnv(t, srv.URL)
+
+	content := "first line\nsecond line with literal \\n\n"
+	cmd := newSkillUpdateTestCmd()
+	_ = cmd.Flags().Set("content-stdin", "true")
+	pipeStdin(t, content, func() {
+		if _, err := captureStdout(t, func() error { return runSkillUpdate(cmd, []string{"skill-123"}) }); err != nil {
+			t.Fatalf("runSkillUpdate: %v", err)
+		}
+	})
+	if body["content"] != content {
+		t.Fatalf("content = %q, want verbatim %q", body["content"], content)
+	}
+}
+
+func TestRunSkillFilesUpsertReadsContentFileVerbatim(t *testing.T) {
+	var body map[string]any
+	srv := newSkillBodyCaptureServer(t, http.MethodPut, "/api/skills/skill-123/files", &body)
+	defer srv.Close()
+	setSkillServerEnv(t, srv.URL)
+
+	content := "file asset body\n\n"
+	path := t.TempDir() + string(os.PathSeparator) + "asset.txt"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write content file: %v", err)
+	}
+
+	cmd := newSkillFilesUpsertTestCmd()
+	_ = cmd.Flags().Set("path", "docs/SKILL.md")
+	_ = cmd.Flags().Set("content-file", path)
+	if _, err := captureStdout(t, func() error { return runSkillFilesUpsert(cmd, []string{"skill-123"}) }); err != nil {
+		t.Fatalf("runSkillFilesUpsert: %v", err)
+	}
+	if body["path"] != "docs/SKILL.md" {
+		t.Fatalf("path = %v", body["path"])
+	}
+	if body["content"] != content {
+		t.Fatalf("content = %q, want verbatim %q", body["content"], content)
+	}
+}
+
+func TestRunSkillContentInputsAreMutuallyExclusive(t *testing.T) {
+	setSkillServerEnv(t, "http://127.0.0.1:1")
+
+	path := t.TempDir() + string(os.PathSeparator) + "SKILL.md"
+	if err := os.WriteFile(path, []byte("body"), 0o644); err != nil {
+		t.Fatalf("write tempfile: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		set  func(*cobra.Command)
+	}{
+		{name: "inline + stdin", set: func(cmd *cobra.Command) {
+			_ = cmd.Flags().Set("content", "inline")
+			_ = cmd.Flags().Set("content-stdin", "true")
+		}},
+		{name: "inline + file", set: func(cmd *cobra.Command) {
+			_ = cmd.Flags().Set("content", "inline")
+			_ = cmd.Flags().Set("content-file", path)
+		}},
+		{name: "stdin + file", set: func(cmd *cobra.Command) {
+			_ = cmd.Flags().Set("content-stdin", "true")
+			_ = cmd.Flags().Set("content-file", path)
+		}},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := newSkillCreateTestCmd()
+			_ = cmd.Flags().Set("name", "skill-name")
+			tt.set(cmd)
+			err := runSkillCreate(cmd, nil)
+			if err == nil {
+				t.Fatalf("expected mutually-exclusive error")
+			}
+			if !strings.Contains(err.Error(), "mutually exclusive") {
+				t.Fatalf("error = %v, want mutually exclusive", err)
+			}
+		})
+	}
+}
+
+func TestRunSkillContentFileAndStdinRejectEmptyInput(t *testing.T) {
+	setSkillServerEnv(t, "http://127.0.0.1:1")
+
+	emptyPath := t.TempDir() + string(os.PathSeparator) + "empty.md"
+	if err := os.WriteFile(emptyPath, []byte(""), 0o644); err != nil {
+		t.Fatalf("write tempfile: %v", err)
+	}
+
+	cmd := newSkillCreateTestCmd()
+	_ = cmd.Flags().Set("name", "skill-name")
+	_ = cmd.Flags().Set("content-file", emptyPath)
+	if err := runSkillCreate(cmd, nil); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty content-file error = %v", err)
+	}
+
+	cmd = newSkillCreateTestCmd()
+	_ = cmd.Flags().Set("name", "skill-name")
+	_ = cmd.Flags().Set("content-stdin", "true")
+	pipeStdin(t, "", func() {
+		if err := runSkillCreate(cmd, nil); err == nil || !strings.Contains(err.Error(), "empty") {
+			t.Fatalf("empty content-stdin error = %v", err)
+		}
+	})
+}
+
+func TestRunSkillInlineEmptyContentKeepsExistingBehavior(t *testing.T) {
+	var createBody map[string]any
+	createSrv := newSkillBodyCaptureServer(t, http.MethodPost, "/api/skills", &createBody)
+	defer createSrv.Close()
+	setSkillServerEnv(t, createSrv.URL)
+
+	createCmd := newSkillCreateTestCmd()
+	_ = createCmd.Flags().Set("name", "skill-name")
+	_ = createCmd.Flags().Set("content", "")
+	if _, err := captureStdout(t, func() error { return runSkillCreate(createCmd, nil) }); err != nil {
+		t.Fatalf("runSkillCreate: %v", err)
+	}
+	if _, ok := createBody["content"]; ok {
+		t.Fatalf("create body unexpectedly included empty content: %#v", createBody)
+	}
+
+	var updateBody map[string]any
+	updateSrv := newSkillBodyCaptureServer(t, http.MethodPut, "/api/skills/skill-123", &updateBody)
+	defer updateSrv.Close()
+	setSkillServerEnv(t, updateSrv.URL)
+
+	updateCmd := newSkillUpdateTestCmd()
+	_ = updateCmd.Flags().Set("content", "")
+	if _, err := captureStdout(t, func() error { return runSkillUpdate(updateCmd, []string{"skill-123"}) }); err != nil {
+		t.Fatalf("runSkillUpdate: %v", err)
+	}
+	if updateBody["content"] != "" {
+		t.Fatalf("update content = %q, want empty string", updateBody["content"])
+	}
+
+	upsertCmd := newSkillFilesUpsertTestCmd()
+	_ = upsertCmd.Flags().Set("path", "docs/SKILL.md")
+	_ = upsertCmd.Flags().Set("content", "")
+	if err := runSkillFilesUpsert(upsertCmd, []string{"skill-123"}); err == nil || !strings.Contains(err.Error(), "--content is required") {
+		t.Fatalf("upsert inline empty error = %v", err)
+	}
+}
+
+func TestRunSkillRefreshPostsToRefreshEndpointAndPrintsTable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-123")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/skills/skill-123/refresh" {
+			t.Fatalf("path = %q, want /api/skills/skill-123/refresh", r.URL.Path)
+		}
+		if r.Header.Get("X-Workspace-ID") != "workspace-123" {
+			t.Fatalf("X-Workspace-ID = %q, want workspace-123", r.Header.Get("X-Workspace-ID"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":          "skill-123",
+			"name":        "review-helper",
+			"description": "refreshed",
+			"content":     "# refreshed",
+			"files":       []any{},
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	cmd := &cobra.Command{Use: "refresh"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("output", "table", "")
+
+	out, err := captureStdout(t, func() error {
+		return runSkillRefresh(cmd, []string{"skill-123"})
+	})
+	if err != nil {
+		t.Fatalf("runSkillRefresh: %v", err)
+	}
+	if !strings.Contains(out, "review-helper") || !strings.Contains(out, "skill-123") {
+		t.Fatalf("table output %q must contain skill name and id", out)
+	}
+}
+
+func TestRunSkillRefreshJsonPrintsSkill(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	t.Setenv("MULTICA_WORKSPACE_ID", "workspace-123")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":   "skill-123",
+			"name": "review-helper",
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	cmd := &cobra.Command{Use: "refresh"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("output", "json", "")
+
+	out, err := captureStdout(t, func() error {
+		return runSkillRefresh(cmd, []string{"skill-123"})
+	})
+	if err != nil {
+		t.Fatalf("runSkillRefresh: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("decode stdout JSON %q: %v", out, err)
+	}
+	if got["id"] != "skill-123" || got["name"] != "review-helper" {
+		t.Fatalf("got = %#v", got)
+	}
+}
+
+func newSkillGetTestCmd(withContent bool) *cobra.Command {
+	cmd := &cobra.Command{Use: "get"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("output", "json", "")
+	cmd.Flags().Bool("with-content", withContent, "")
+	return cmd
+}
+
+func newSkillFilesListTestCmd(withContent bool) *cobra.Command {
+	cmd := &cobra.Command{Use: "list"}
+	cmd.Flags().String("server-url", "", "")
+	cmd.Flags().String("workspace-id", "", "")
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("output", "table", "")
+	cmd.Flags().Bool("with-content", withContent, "")
+	return cmd
+}
+
+// newSkillQueryCaptureServer records the query string the CLI sent and answers
+// with an empty payload of the right shape.
+func newSkillQueryCaptureServer(t *testing.T, wantPath string, gotQuery *string, payload any) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wantPath {
+			t.Errorf("path = %q, want %q", r.URL.Path, wantPath)
+		}
+		*gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// `skill get`'s table view prints four columns; asking for every file body to
+// render them is what made a large skill unfetchable (GH #7498).
+func TestRunSkillGetAsksForMetadataUnlessContentRequested(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		withContent bool
+		wantQuery   string
+	}{
+		{"default", false, "include=metadata"},
+		{"--with-content", true, "include=content"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			var gotQuery string
+			srv := newSkillQueryCaptureServer(t, "/api/skills/skill-123", &gotQuery, map[string]any{
+				"id":   "skill-123",
+				"name": "review-helper",
+			})
+			setSkillServerEnv(t, srv.URL)
+
+			if _, err := captureStdout(t, func() error {
+				return runSkillGet(newSkillGetTestCmd(tc.withContent), []string{"skill-123"})
+			}); err != nil {
+				t.Fatalf("runSkillGet: %v", err)
+			}
+			if gotQuery != tc.wantQuery {
+				t.Errorf("query = %q, want %q", gotQuery, tc.wantQuery)
+			}
+		})
+	}
+}
+
+func TestRunSkillFilesListAsksForMetadataUnlessContentRequested(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		withContent bool
+		wantQuery   string
+	}{
+		{"default", false, "include=metadata"},
+		{"--with-content", true, "include=content"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			var gotQuery string
+			srv := newSkillQueryCaptureServer(t, "/api/skills/skill-123/files", &gotQuery, []any{})
+			setSkillServerEnv(t, srv.URL)
+
+			if _, err := captureStdout(t, func() error {
+				return runSkillFilesList(newSkillFilesListTestCmd(tc.withContent), []string{"skill-123"})
+			}); err != nil {
+				t.Fatalf("runSkillFilesList: %v", err)
+			}
+			if gotQuery != tc.wantQuery {
+				t.Errorf("query = %q, want %q", gotQuery, tc.wantQuery)
+			}
+		})
+	}
+}
+
+// The size column exists to name the oversized file. Rendering it through
+// strVal would print a 1.2MB file as "1.234567e+06" — JSON numbers decode as
+// float64 — which is unreadable at exactly the sizes that matter.
+func TestRunSkillFilesListRendersReadableSizes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var gotQuery string
+	srv := newSkillQueryCaptureServer(t, "/api/skills/skill-123/files", &gotQuery, []any{
+		map[string]any{"id": "f1", "path": "reference.md", "size": 1234567, "content_hash": "abc"},
+		map[string]any{"id": "f2", "path": "small.md", "size": 128, "content_hash": "def"},
+	})
+	setSkillServerEnv(t, srv.URL)
+
+	out, err := captureStdout(t, func() error {
+		return runSkillFilesList(newSkillFilesListTestCmd(false), []string{"skill-123"})
+	})
+	if err != nil {
+		t.Fatalf("runSkillFilesList: %v", err)
+	}
+	if !strings.Contains(out, "SIZE") {
+		t.Errorf("table has no SIZE column: %q", out)
+	}
+	if strings.Contains(out, "e+06") {
+		t.Errorf("size rendered in scientific notation: %q", out)
+	}
+	if !strings.Contains(out, "1.2 MiB") {
+		t.Errorf("expected a human-readable size for the large file, got %q", out)
+	}
+	if !strings.Contains(out, "128 B") {
+		t.Errorf("expected an exact byte count for the small file, got %q", out)
+	}
+}
+
+func newSkillLabelTestCmd(action string) *cobra.Command {
+	cmd := &cobra.Command{Use: action}
+	cmd.Flags().String("output", "json", "")
+	cmd.Flags().Bool("full-id", false, "")
+	return cmd
+}
+
+func TestRunSkillLabelCommands(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	var lastMethod, lastPath string
+	var lastBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastMethod = r.Method
+		lastPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/api/skills/skill-1/labels" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"labels": []map[string]any{
+					{"id": testLabelUUID, "name": "mattpocock", "color": "#3b82f6"},
+				},
+			})
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/api/skills/skill-1/labels" {
+			_ = json.NewDecoder(r.Body).Decode(&lastBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"labels": []map[string]any{
+					{"id": testLabelUUID, "name": "mattpocock", "color": "#3b82f6"},
+				},
+			})
+			return
+		}
+		if r.Method == http.MethodDelete && r.URL.Path == "/api/skills/skill-1/labels/"+testLabelUUID {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/api/labels" {
+			if got := r.URL.Query().Get("resource_type"); got != "skill" {
+				t.Fatalf("resource_type = %q, want skill", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"labels": []map[string]any{
+					{"id": testLabelUUID, "name": "mattpocock", "color": "#3b82f6"},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+
+	// 1. List labels on skill
+	listCmd := newSkillLabelTestCmd("list")
+	out, err := captureStdout(t, func() error {
+		return runSkillLabelList(listCmd, []string{"skill-1"})
+	})
+	if err != nil {
+		t.Fatalf("runSkillLabelList: %v", err)
+	}
+	var gotList []map[string]any
+	if err := json.Unmarshal([]byte(out), &gotList); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if len(gotList) != 1 || gotList[0]["name"] != "mattpocock" {
+		t.Fatalf("list output = %#v", gotList)
+	}
+
+	// 2. Add label to skill
+	addCmd := newSkillLabelTestCmd("add")
+	out, err = captureStdout(t, func() error {
+		return runSkillLabelAdd(addCmd, []string{"skill-1", testLabelUUID})
+	})
+	if err != nil {
+		t.Fatalf("runSkillLabelAdd: %v", err)
+	}
+	if lastMethod != http.MethodPost || lastPath != "/api/skills/skill-1/labels" {
+		t.Fatalf("add request: method=%s, path=%s", lastMethod, lastPath)
+	}
+	if lastBody["label_id"] != testLabelUUID {
+		t.Fatalf("add body: %#v, want label_id %s", lastBody, testLabelUUID)
+	}
+
+	// Short IDs from `label list --resource-type skill` resolve against skill labels.
+	_, err = captureStdout(t, func() error {
+		return runSkillLabelAdd(addCmd, []string{"skill-1", "1111"})
+	})
+	if err != nil {
+		t.Fatalf("runSkillLabelAdd with short label ID: %v", err)
+	}
+
+	// 3. Remove label from skill
+	removeCmd := newSkillLabelTestCmd("remove")
+	out, err = captureStdout(t, func() error {
+		return runSkillLabelRemove(removeCmd, []string{"skill-1", testLabelUUID})
+	})
+	if err != nil {
+		t.Fatalf("runSkillLabelRemove: %v", err)
+	}
+	if lastMethod != http.MethodGet || lastPath != "/api/skills/skill-1/labels" {
+		t.Fatalf("remove follow-up request: method=%s, path=%s", lastMethod, lastPath)
+	}
+}

@@ -1,0 +1,94 @@
+---
+title: Mobile app (iOS)
+description: Install Multica on your iPhone from source, and connect to Cloud or a self-hosted instance.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+The Multica iOS client is not on the App Store yet. You can build a Release version from the open-source repository on a Mac and install it on your own iPhone. There is no Android client yet.
+
+The installed app connects to Multica Cloud by default; sign in with your existing account. Workspaces, issues, comments, and run history all live on the server — nothing needs to be synced manually from web or Desktop.
+
+## Prerequisites
+
+You need:
+
+- a Mac with Xcode installed;
+- an Apple ID signed in under **Xcode → Settings → Accounts**;
+- an iPhone connected via USB;
+- Developer Mode enabled on the iPhone under **Settings → Privacy & Security**;
+- Node.js, pnpm, and Git.
+
+If Xcode or the on-device development environment isn't set up yet, complete Expo's [iOS device environment setup](https://docs.expo.dev/get-started/set-up-your-environment/) first.
+
+## Installing to your iPhone
+
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/multica-ai/multica.git
+cd multica
+pnpm install
+```
+
+Then run from the repo root:
+
+```bash
+pnpm ios:mobile:device:prod:release
+```
+
+This builds a Release version with no Metro dependency and installs it on the connected iPhone. The first build downloads iOS dependencies and compiles React Native; later builds reuse Xcode's cache.
+
+If the iPhone blocks the app from opening, trust the developer certificate under **Settings → General → VPN & Device Management**.
+
+## 7-day limit of free signing
+
+Apps signed with a free Apple ID only work for 7 days. When that expires, reconnect the iPhone to your Mac and re-run the same build command to re-sign.
+
+Builds signed with an Apple Developer Program account stay valid longer and can also be used for TestFlight and regular distribution. With either kind of signing, server-side data is never lost by reinstalling or re-signing.
+
+## Signing failures
+
+If Xcode reports `No matching provisioning profiles found`, the default bundle identifier may not belong to your Apple ID. Switch to a reverse-domain name you control and rebuild:
+
+```bash
+export EXPO_BUNDLE_IDENTIFIER_PROD=com.yourname.multica
+pnpm ios:mobile:device:prod:release
+```
+
+The value only needs to be available in your Apple Developer team; it does not affect your Multica account or workspaces.
+
+## Updating
+
+The self-installed iOS build does not auto-update. Pull the latest code, update dependencies, and rebuild:
+
+```bash
+git pull --ff-only
+pnpm install
+pnpm ios:mobile:device:prod:release
+```
+
+## Connecting to a self-hosted instance
+
+Release builds bake the API address into the app. To connect to a self-hosted instance, edit `apps/mobile/.env.production` first:
+
+```dotenv
+EXPO_PUBLIC_API_URL=https://api.example.com
+EXPO_PUBLIC_WEB_URL=https://app.example.com
+```
+
+`EXPO_PUBLIC_API_URL` is required. `EXPO_PUBLIC_WEB_URL` is optional and powers entries like "Copy link" and "Open on web"; when it's unset, those menu items are hidden.
+
+Re-run the build command after editing. The iPhone must be able to reach the API address; when using a LAN address, don't write `localhost` — on the iPhone it points at the phone itself.
+
+<Callout type="warning">
+Editing `.env.production` changes the production configuration of the current checkout. Committing the change writes your personal API address into the repository's production configuration.
+</Callout>
+
+For mobile development, using the Simulator, or connecting to staging, see [`apps/mobile/README.md`](https://github.com/multica-ai/multica/blob/main/apps/mobile/README.md) in the repository.
+
+## Next steps
+
+- [Quickstart](/cloud-quickstart) — complete your first run.
+- [Desktop app](/desktop-app) — desktop tabs and the built-in daemon.
+- [Troubleshooting](/troubleshooting) — diagnosing connection and run issues.

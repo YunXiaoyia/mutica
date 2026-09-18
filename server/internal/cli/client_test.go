@@ -1,0 +1,627 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestPostJSON(t *testing.T) {
+	type reqBody struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+	type respBody struct {
+		ID string `json:"id"`
+	}
+
+	t.Run("success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+				t.Errorf("expected Content-Type application/json, got %s", ct)
+			}
+			if auth := r.Header.Get("Authorization"); auth != "Bearer test-token" {
+				t.Errorf("expected Authorization Bearer test-token, got %s", auth)
+			}
+
+			var body reqBody
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("failed to decode request body: %v", err)
+			}
+			if body.Name != "alice" || body.Age != 30 {
+				t.Errorf("unexpected body: %+v", body)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(respBody{ID: "123"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		var out respBody
+		err := client.PostJSON(context.Background(), "/test", reqBody{Name: "alice", Age: 30}, &out)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out.ID != "123" {
+			t.Errorf("expected ID 123, got %s", out.ID)
+		}
+	})
+
+	t.Run("error status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, "bad request")
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		err := client.PostJSON(context.Background(), "/test", reqBody{Name: "bob"}, nil)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if got := err.Error(); got != "POST /test returned 400: bad request" {
+			t.Errorf("unexpected error message: %s", got)
+		}
+	})
+
+	t.Run("nil output", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		err := client.PostJSON(context.Background(), "/test", reqBody{Name: "charlie"}, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("workspace and agent context headers", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ws := r.Header.Get("X-Workspace-ID"); ws != "ws-abc" {
+				t.Errorf("expected X-Workspace-ID ws-abc, got %s", ws)
+			}
+			if agent := r.Header.Get("X-Agent-ID"); agent != "agent-123" {
+				t.Errorf("expected X-Agent-ID agent-123, got %s", agent)
+			}
+			if task := r.Header.Get("X-Task-ID"); task != "task-456" {
+				t.Errorf("expected X-Task-ID task-456, got %s", task)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(respBody{ID: "456"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-abc", "test-token")
+		client.AgentID = "agent-123"
+		client.TaskID = "task-456"
+		var out respBody
+		err := client.PostJSON(context.Background(), "/test", reqBody{}, &out)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("client identity headers", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("X-Client-Platform"); got != "cli-test" {
+				t.Errorf("expected X-Client-Platform cli-test, got %s", got)
+			}
+			if got := r.Header.Get("X-Client-Version"); got != "9.9.9" {
+				t.Errorf("expected X-Client-Version 9.9.9, got %s", got)
+			}
+			if got := r.Header.Get("X-Client-OS"); got != "linux" {
+				t.Errorf("expected X-Client-OS linux, got %s", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		client.Platform = "cli-test"
+		client.Version = "9.9.9"
+		client.OS = "linux"
+		if err := client.PostJSON(context.Background(), "/test", reqBody{}, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("client identity headers fall back to package defaults", func(t *testing.T) {
+		origPlatform, origVersion, origOS := ClientPlatform, ClientVersion, ClientOS
+		ClientPlatform = "cli"
+		ClientVersion = "1.2.3-test"
+		ClientOS = "macos"
+		t.Cleanup(func() {
+			ClientPlatform, ClientVersion, ClientOS = origPlatform, origVersion, origOS
+		})
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("X-Client-Platform"); got != "cli" {
+				t.Errorf("expected X-Client-Platform cli, got %s", got)
+			}
+			if got := r.Header.Get("X-Client-Version"); got != "1.2.3-test" {
+				t.Errorf("expected X-Client-Version 1.2.3-test, got %s", got)
+			}
+			if got := r.Header.Get("X-Client-OS"); got != "macos" {
+				t.Errorf("expected X-Client-OS macos, got %s", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		if err := client.PostJSON(context.Background(), "/test", reqBody{}, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestDeleteJSONResponse(t *testing.T) {
+	type respBody struct {
+		ID string `json:"id"`
+	}
+
+	t.Run("success decodes response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodDelete {
+				t.Errorf("expected DELETE, got %s", r.Method)
+			}
+			if auth := r.Header.Get("Authorization"); auth != "Bearer test-token" {
+				t.Errorf("expected Authorization Bearer test-token, got %s", auth)
+			}
+			json.NewEncoder(w).Encode(respBody{ID: "comment-123"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		var out respBody
+		if err := client.DeleteJSONResponse(context.Background(), "/test", &out); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out.ID != "comment-123" {
+			t.Errorf("expected ID comment-123, got %s", out.ID)
+		}
+	})
+
+	t.Run("error status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, "missing")
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		err := client.DeleteJSONResponse(context.Background(), "/test", nil)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if got := err.Error(); got != "DELETE /test returned 404: missing" {
+			t.Errorf("unexpected error message: %s", got)
+		}
+	})
+}
+
+func TestDownloadFile(t *testing.T) {
+	t.Run("relative URL is resolved against BaseURL and sent with auth", func(t *testing.T) {
+		var gotPath, gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			gotAuth = r.Header.Get("Authorization")
+			w.Write([]byte("hello"))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		data, err := client.DownloadFile(context.Background(), "/uploads/workspaces/abc/file.md")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(data) != "hello" {
+			t.Errorf("unexpected body: %q", string(data))
+		}
+		if gotPath != "/uploads/workspaces/abc/file.md" {
+			t.Errorf("unexpected path: %q", gotPath)
+		}
+		if gotAuth != "Bearer test-token" {
+			t.Errorf("expected Authorization Bearer test-token, got %q", gotAuth)
+		}
+	})
+
+	t.Run("absolute URL is used as-is without auth headers", func(t *testing.T) {
+		var gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			w.Write([]byte("signed-payload"))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient("https://api.example.test", "", "test-token")
+		data, err := client.DownloadFile(context.Background(), srv.URL+"/signed?sig=abc")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(data) != "signed-payload" {
+			t.Errorf("unexpected body: %q", string(data))
+		}
+		if gotAuth != "" {
+			t.Errorf("expected no Authorization header on signed URL, got %q", gotAuth)
+		}
+	})
+
+	t.Run("relative URL with empty BaseURL returns a helpful error", func(t *testing.T) {
+		client := NewAPIClient("", "", "test-token")
+		_, err := client.DownloadFile(context.Background(), "/uploads/x.md")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("non-2xx status returns an error with the response body", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, "not found")
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "test-token")
+		_, err := client.DownloadFile(context.Background(), "/uploads/missing")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+}
+
+func TestUploadFileWithURL(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			if ct := r.Header.Get("Content-Type"); !strings.Contains(ct, "multipart/form-data") {
+				t.Errorf("expected multipart content-type, got %s", ct)
+			}
+
+			file, header, err := r.FormFile("file")
+			if err != nil {
+				t.Fatalf("missing file field: %v", err)
+			}
+			defer file.Close()
+
+			data, _ := io.ReadAll(file)
+			if string(data) != "hello" {
+				t.Errorf("unexpected file data: %q", string(data))
+			}
+			if header.Filename != "test.txt" {
+				t.Errorf("unexpected filename: %q", header.Filename)
+			}
+
+			// Verify no issue_id or comment_id fields are sent.
+			if r.FormValue("issue_id") != "" {
+				t.Errorf("unexpected issue_id field")
+			}
+			if r.FormValue("comment_id") != "" {
+				t.Errorf("unexpected comment_id field")
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(AttachmentResponse{
+				ID:        "att-123",
+				URL:       "https://cdn.example.com/file.txt",
+				Filename:  "test.txt",
+				SizeBytes: 5,
+			})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		id, url, err := client.UploadFileWithURL(context.Background(), []byte("hello"), "test.txt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != "att-123" {
+			t.Errorf("expected id att-123, got %s", id)
+		}
+		if url != "https://cdn.example.com/file.txt" {
+			t.Errorf("expected url https://cdn.example.com/file.txt, got %s", url)
+		}
+	})
+
+	t.Run("error status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, "bad request")
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		_, _, err := client.UploadFileWithURL(context.Background(), []byte("x"), "x.txt")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("expected *HTTPError, got %T: %v", err, err)
+		}
+		if httpErr.StatusCode != 400 {
+			t.Errorf("expected status 400, got %d", httpErr.StatusCode)
+		}
+	})
+
+	t.Run("missing id in response succeeds (fallback path)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"url": "https://example.com"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		id, url, err := client.UploadFileWithURL(context.Background(), []byte("x"), "x.txt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != "" {
+			t.Errorf("expected empty id, got %s", id)
+		}
+		if url != "https://example.com" {
+			t.Errorf("expected url https://example.com, got %s", url)
+		}
+	})
+
+	t.Run("workspace header sent", func(t *testing.T) {
+		var gotWorkspace string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotWorkspace = r.Header.Get("X-Workspace-ID")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(AttachmentResponse{ID: "att-1", URL: "https://example.com"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-abc", "test-token")
+		_, _, err := client.UploadFileWithURL(context.Background(), []byte("x"), "x.txt")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotWorkspace != "ws-abc" {
+			t.Errorf("expected X-Workspace-ID ws-abc, got %s", gotWorkspace)
+		}
+	})
+
+	t.Run("missing url in response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(AttachmentResponse{ID: "att-123"})
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		_, _, err := client.UploadFileWithURL(context.Background(), []byte("x"), "x.txt")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "missing attachment url") {
+			t.Errorf("unexpected error message: %s", err.Error())
+		}
+	})
+}
+
+func TestUploadPrivatePlugin(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/workspaces/ws-1/plugins/private/install" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("X-Workspace-ID") != "ws-1" {
+			t.Fatalf("missing authenticated workspace headers: %#v", r.Header)
+		}
+		file, header, err := r.FormFile("artifact")
+		if err != nil {
+			t.Fatalf("artifact form file: %v", err)
+		}
+		defer file.Close()
+		contents, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Filename != "private.zip" || string(contents) != "zip-bytes" {
+			t.Fatalf("unexpected artifact filename=%q content=%q", header.Filename, contents)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": "installation-1"})
+	}))
+	defer server.Close()
+
+	client := NewAPIClient(server.URL, "ws-1", "test-token")
+	var response map[string]string
+	err := client.UploadPrivatePlugin(context.Background(), "/api/workspaces/ws-1/plugins/private/install", []byte("zip-bytes"), "private.zip", &response)
+	if err != nil {
+		t.Fatalf("UploadPrivatePlugin: %v", err)
+	}
+	if response["id"] != "installation-1" {
+		t.Fatalf("unexpected response: %#v", response)
+	}
+}
+
+func TestNormalizeGOOS(t *testing.T) {
+	cases := map[string]string{
+		"darwin":  "macos",
+		"windows": "windows",
+		"linux":   "linux",
+		"freebsd": "freebsd",
+	}
+	for in, want := range cases {
+		if got := normalizeGOOS(in); got != want {
+			t.Errorf("normalizeGOOS(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestSetHeaders_AdvertisesStableAttachmentURLs is the only test that proves
+// Phase 1 of MUL-5372 is actually switched on.
+//
+// The server-side tests verify that a request carrying
+// `X-Client-Capabilities: stable_attachment_urls` gets stable attachment paths,
+// but nothing there observes what the CLI sends. Without this assertion a typo
+// in the token, or dropping the header from setHeaders entirely, would leave
+// every other test green while the CLI silently went back to receiving ~800-char
+// signed URLs on every attachment of every list read.
+//
+// The exact string is load-bearing: the server matches the token literally
+// (handler.requestHasClientCapability), so it is asserted verbatim rather than
+// through the constant.
+func TestSetHeaders_AdvertisesStableAttachmentURLs(t *testing.T) {
+	const wantCapability = "stable_attachment_urls"
+
+	// Every verb goes through setHeaders, and an agent's read path is not only
+	// GET (comment add posts, attachment upload multiparts). Cover the shapes
+	// that actually carry attachment payloads back.
+	t.Run("GET", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		var out map[string]any
+		if err := client.GetJSON(context.Background(), "/api/issues/x/comments", &out); err != nil {
+			t.Fatalf("GetJSON: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q — Phase 1 is off unless the CLI advertises this", got, wantCapability)
+		}
+	})
+
+	t.Run("GET with headers", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[]`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		var out []map[string]any
+		if _, err := client.GetJSONWithHeaders(context.Background(), "/api/issues/x/comments", &out); err != nil {
+			t.Fatalf("GetJSONWithHeaders: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q", got, wantCapability)
+		}
+	})
+
+	t.Run("POST", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "ws-1", "test-token")
+		var out map[string]any
+		if err := client.PostJSON(context.Background(), "/api/issues/x/comments", map[string]string{"content": "hi"}, &out); err != nil {
+			t.Fatalf("PostJSON: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q", got, wantCapability)
+		}
+	})
+
+	// An unauthenticated client (no token configured yet) must still advertise:
+	// the capability describes what the binary can parse, not who it is.
+	t.Run("without a token", func(t *testing.T) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Client-Capabilities")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		client := NewAPIClient(srv.URL, "", "")
+		var out map[string]any
+		if err := client.GetJSON(context.Background(), "/api/health", &out); err != nil {
+			t.Fatalf("GetJSON: %v", err)
+		}
+		if got != wantCapability {
+			t.Errorf("X-Client-Capabilities = %q, want %q", got, wantCapability)
+		}
+	})
+}
+
+// TestHTTPErrorTaskScopedFollowsTheRequestNotTheClient wires the credential
+// claim to what actually went out on the wire.
+//
+// Reading the client's Token field instead is wrong in a way a hand-built
+// HTTPError cannot show: DownloadFile deliberately sends no Authorization
+// header for an absolute signed URL, so a 401 from object storage would be
+// reported to an agent as "your task token was rejected, stop" purely because
+// the client happened to hold one.
+func TestHTTPErrorTaskScopedFollowsTheRequestNotTheClient(t *testing.T) {
+	var sawAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAuth = append(sawAuth, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"unauthorized"}`)
+	}))
+	defer srv.Close()
+
+	taskClient := NewAPIClient(srv.URL, "ws-1", TaskTokenPrefix+"0123456789abcdef")
+
+	t.Run("api call sends the task token", func(t *testing.T) {
+		err := taskClient.GetJSON(context.Background(), "/api/me", &struct{}{})
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("err = %v, want an *HTTPError", err)
+		}
+		if !httpErr.TaskScoped {
+			t.Error("a 401 on a request that carried the task token must be marked task-scoped")
+		}
+		if got := FormatError(err, false); !strings.Contains(got, "task token") {
+			t.Errorf("message did not use the task-token copy: %q", got)
+		}
+	})
+
+	t.Run("signed absolute URL sends no credential at all", func(t *testing.T) {
+		before := len(sawAuth)
+		_, err := taskClient.DownloadFile(context.Background(), srv.URL+"/signed-object?sig=abc")
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("err = %v, want an *HTTPError", err)
+		}
+		if auth := sawAuth[before]; auth != "" {
+			t.Fatalf("DownloadFile sent %q on an absolute URL; the test no longer covers the unauthenticated path", auth)
+		}
+		if httpErr.TaskScoped {
+			t.Error("a 401 from an unauthenticated signed URL must not be reported as a rejected task token")
+		}
+		if got := FormatError(err, false); strings.Contains(got, "task token") {
+			t.Errorf("storage 401 got the task-token copy: %q", got)
+		}
+	})
+
+	t.Run("member token is never task-scoped", func(t *testing.T) {
+		memberClient := NewAPIClient(srv.URL, "ws-1", "mul_0123456789abcdef")
+		err := memberClient.GetJSON(context.Background(), "/api/me", &struct{}{})
+		var httpErr *HTTPError
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("err = %v, want an *HTTPError", err)
+		}
+		if httpErr.TaskScoped {
+			t.Error("a member credential must not be reported as a task token")
+		}
+	})
+}

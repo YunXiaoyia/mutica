@@ -1,0 +1,101 @@
+---
+title: 认证与令牌
+description: 了解浏览器登录、个人访问令牌，以及智能体执行时使用的临时凭据。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+日常使用 Multica 时，你主要会接触两种凭据：浏览器登录会话和个人访问令牌。浏览器会话用于 Web 与 Desktop；个人访问令牌用于 CLI、守护进程、脚本和 API。
+
+## 浏览器登录会话
+
+通过邮箱验证码或 Google 登录后，Multica 会把 JWT 保存到名为 `multica_auth` 的 HttpOnly cookie 中。浏览器自动携带它，JavaScript 无法直接读取。
+
+会话默认有效 30 天，但这不是从登录起算的倒计时：持续使用的会话会在到期前自动续期，所以不需要每隔一段时间重新登录一次。续期只在剩余有效期过半之后才发生，因此闲置的会话可能在最后一次使用后不到 30 天就失效。自托管管理员可以通过 `AUTH_TOKEN_TTL` 调整有效期，见[登录与注册](/auth-setup#登录有效期)。退出登录会清除当前浏览器的认证与 CSRF cookie。
+
+浏览器 cookie 不适合复制到脚本或 CLI；从终端访问 Multica 使用个人访问令牌。
+
+## 个人访问令牌
+
+个人访问令牌（PAT）以 `mul_` 开头，代表你的账号。它可以访问你有权访问的全部工作区和 API，需要像密码一样保管。
+
+在 **设置 → API Token** 中创建令牌时，需要填写名称，并选择 30 天、90 天、1 年或永不过期，默认选中 90 天。完整令牌只显示一次；关闭窗口后，Multica 只保留：
+
+- 令牌的哈希值；
+- 用于辨认它的开头几位；
+- 名称、创建时间、过期时间和最近使用时间。
+
+完整值无法找回，丢失时吊销旧令牌并创建新的。
+
+<Callout type="warning">
+不要把 PAT 写入仓库、任务、评论、截图或日志，也不要直接放进会被保存的 shell 命令中。
+</Callout>
+
+## CLI 与 PAT
+
+运行 `multica login` 时，CLI 会通过浏览器完成登录，再创建一个有效期为 90 天的 PAT，保存到当前 profile 的配置文件：
+
+```text
+~/.multica/config.json
+~/.multica/profiles/<name>/config.json
+```
+
+守护进程使用同一个 PAT 连接 Multica。带过期时间的 `mul_` PAT 在剩余有效期不足 7 天时自动续期，延长到当时起 90 天后。续期失败不会改变令牌本身；令牌已经过期或被吊销时，需要重新运行 `multica login`。
+
+无浏览器环境可以先在 Web 中创建 PAT，再让 CLI 安全地提示输入：
+
+```bash
+multica login --token
+```
+
+## 在 API 请求中使用 PAT
+
+把 PAT 放进 `Authorization` header：
+
+```bash
+export MULTICA_TOKEN='mul_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+curl https://api.multica.ai/api/me \
+ -H "Authorization: Bearer $MULTICA_TOKEN"
+```
+
+调用工作区级 API 时，还需要按接口要求提供工作区：
+
+```bash
+curl https://api.multica.ai/api/issues \
+ -H "Authorization: Bearer $MULTICA_TOKEN" \
+ -H "X-Workspace-ID: $MULTICA_WORKSPACE_ID"
+```
+
+脚本中的令牌取自 secret manager 或受保护的环境变量，不要硬编码。自托管实例把域名替换为自己的公开 API 地址。
+
+## 退出登录与吊销
+
+`multica auth logout` 只删除当前 CLI profile 中保存的 PAT；Web 退出登录只删除当前浏览器的 cookie。它们不会吊销服务器上的个人访问令牌。
+
+如果令牌可能泄露，到 **设置 → API Token** 中立即吊销。吊销后，这个 PAT 无法再次使用，已经保存它的其他电脑和脚本也会失去访问权限。
+
+## 智能体执行的临时令牌
+
+守护进程领取运行后，服务器会为这次执行创建一个以 `mat_` 开头的临时令牌。它绑定当前用户、工作区、智能体和运行，最长有效 24 小时，并在运行结束时清理。
+
+守护进程把这个临时令牌注入 AI 编程工具，而不是把用户 PAT 交给智能体。因此，智能体发出的请求会记录为智能体行为，也不能借此调用只允许用户或 owner 执行的敏感操作。
+
+这类令牌由服务器自动创建，用户不需要保存或管理。
+
+## 其他机器凭据
+
+服务端还识别两种内部或托管场景中的凭据：
+
+| 前缀 | 用途 | 谁管理 |
+| --- | --- | --- |
+| `mcn_` | Multica Cloud Node 连接 | Multica Cloud Fleet |
+| `mdt_` | 工作区范围的守护进程认证协议 | 服务端内部流程 |
+
+普通 Cloud、自托管和 Desktop 安装都不需要手动创建它们。用户侧的 CLI 与守护进程始终使用 `mul_` PAT；不要自行构造其他前缀的令牌。
+
+## 接下来
+
+- [使用 CLI](/cli) — `login`、`auth status` 和 profile 配置。
+- [守护进程与运行时](/daemon-runtimes) — PAT 续期发生的位置。
+- [登录与注册](/auth-setup) — 会话有效期与注册限制的服务端配置。

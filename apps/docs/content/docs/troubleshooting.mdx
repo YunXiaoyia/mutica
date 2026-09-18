@@ -1,0 +1,237 @@
+---
+title: Troubleshooting
+description: Diagnose common problems with connections, execution, realtime updates, email, and self-hosted services.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+First work out which layer the problem lives in: the Multica service, the daemon, the runtime, or the AI coding tool. These commands are usually enough to surface the first meaningful error:
+
+```bash
+multica version
+multica auth status
+multica daemon status --output json
+multica daemon logs --lines 100
+```
+
+Self-hosted instances can also check the service directly:
+
+```bash
+curl -i https://api.example.com/health
+curl -i https://api.example.com/readyz
+```
+
+`/health` only says the API process is responding; `/readyz` also checks the database and migrations. Include the error, relevant logs, CLI version, and operating system when reporting a problem; remove tokens, email addresses, and other sensitive details before submitting.
+
+## Daemon fails to connect
+
+Run these first:
+
+```bash
+multica auth status
+multica daemon status --output json
+multica daemon logs --lines 100
+```
+
+Common causes include:
+
+- The CLI has not signed in, or the token stored on this machine has expired.
+- The daemon is connected to the wrong Multica service.
+- The executing computer cannot reach the API, or DNS, TLS, or a firewall blocks the connection.
+- The current account is no longer a member of the target workspace.
+- No supported AI coding tool is installed on this machine, so the daemon cannot start.
+
+Sign in again and restart the daemon:
+
+```bash
+multica login
+multica daemon restart
+```
+
+Self-hosted deployments should also request the API's `/health` from the **executing computer** — testing on the server itself cannot expose DNS, TLS, or firewall problems on the executing computer's side. To change the address, rerun `multica setup self-host`, or check the current profile's `server_url`:
+
+```bash
+multica config show
+```
+
+## Issue does not start executing
+
+Open the issue's **execution log** and check the run's current status and what it is waiting for.
+
+### `queued` status
+
+`queued` means the run is still waiting for a runtime to claim it. Check in order:
+
+1. Is the runtime the agent is bound to online?
+2. Did the runtime detect the AI coding tool the agent is configured with?
+3. Does the agent still have concurrency headroom?
+4. Does the daemon still have global execution capacity?
+
+An agent executes at most 6 runs concurrently by default; a single daemon executes at most 20. At the limit, new runs stay in the queue until an active one finishes. Runs also keep queueing while the runtime is offline; they only fail once that runtime has stopped heartbeating for longer than the reconnect grace and the run has itself waited that long, so a long queue behind a busy runtime is never expired for waiting, and assigning work to a machine that is already offline still leaves a full grace to bring it back.
+
+```bash
+multica daemon status --output json
+multica agent get <agent-id>
+multica issue runs <issue-id>
+```
+
+If the runtime list is missing an expected tool, first confirm the tool runs and is signed in under the same system account and `PATH`, then run `multica daemon restart`.
+
+### `waiting_local_directory` status
+
+This means another in-flight run is using the same local directory. Multica waits for the directory lock to be released so two agents never modify the same files at once.
+
+This wait only exists in the directory's `in_place` ("Direct") mode. If the directory is a git repository, switching the resource to `worktree` ("Parallel") removes the queue altogether: each run gets its own worktree and hands its work back as a branch, so nothing waits on anything. See [Project resources](/project-resources#how-runs-share-the-directory).
+
+Otherwise you just wait for the earlier run to finish. If it is stuck, stop it from its execution log, or pick a different local directory for the current agent. This directory mutex lives in the daemon's memory — no lock file is written to disk. If you suspect stale lock state, `multica daemon restart` releases it; there is nothing to delete manually.
+
+## AI coding tool fails to start
+
+An online daemon does not mean the tool itself works. Open the run's detailed record and focus on:
+
+- Whether the tool has completed sign-in.
+- Whether the API key, quota, or model permissions are available.
+- Whether the model and thinking level the agent selected are supported by the tool.
+- Whether the local working directory exists and is writable.
+- Whether the agent's custom arguments or environment variables are valid.
+
+Run the same tool directly in a terminal on the executing computer first. If the tool cannot start on its own, fix its sign-in or configuration, then retry the run from the execution log.
+
+## Realtime updates stop working
+
+If runs still execute but comments and status changes no longer appear live, the WebSocket is usually not connected.
+
+Check the `/ws` connection under **Network → WS** in the browser's developer tools. For self-hosted deployments, focus on:
+
+- Whether `FRONTEND_ORIGIN` matches the address the browser actually opens.
+- Whether an HTTPS page connects over `wss://`.
+- Whether the reverse proxy forwards the WebSocket Upgrade request.
+- Whether the browser sign-in has expired.
+
+A plain `curl` against `/ws` returning HTTP 400 is expected: the endpoint requires workspace-scoped query parameters and rejects a bare handshake before any WebSocket upgrade happens. A 400/401 recorded in the backend logs therefore proves only that ordinary HTTP routing reaches the backend — it does not prove the proxy preserves the WebSocket `Upgrade` headers. To verify the actual connection, open the browser DevTools → Network → WS tab (or use a WebSocket-aware client) and look for a `101` handshake.
+
+Self-host note: daemons dial `/api/daemon/ws` for their long connection (not `/ws`) — route it to the backend the same way. If the WebSocket handshake fails there, the daemon silently falls back to polling; repeated `status=400` lines on that path in the backend log are the symptom.
+
+Containers read `.env` only at creation time; recreate them after changes:
+
+```bash
+docker compose -f docker-compose.selfhost.yml up -d
+```
+
+For a complete reverse-proxy example, see the [self-host quickstart](/self-host-quickstart#3-choose-how-to-access).
+
+## `multica setup` reports the server is not reachable
+
+The CLI reachability probe GETs `<server-url>/health` and needs a 200. The backend serves this path. Current web releases forward `/health` to the backend, but older ones do not — a reverse proxy that forwards everything to such an older frontend returns 404, and the CLI concludes the server is down while the stack is healthy.
+
+Routing `/health` to the backend (port 8080) explicitly in your proxy works across all releases — both Caddy examples in the [self-host quickstart](/self-host-quickstart#3-choose-how-to-access) do this. Confirm with:
+
+```bash
+curl -fsS <server-url>/health
+```
+
+## Verification code and invitation emails not delivered
+
+Check the backend startup log first. It states whether the server is using `SMTP relay`, `Resend API`, or `DEV mode`:
+
+```bash
+docker compose -f docker-compose.selfhost.yml logs backend \
+  | grep "EmailService:"
+```
+
+- **DEV mode**: no email is sent; verification codes and invitation links are only written to the backend log.
+- **Resend**: confirm the API key is valid and the sender address's domain is verified.
+- **SMTP**: confirm the host, port, credentials, and sender address, and use the error log to tell whether the failure happened at the connection, TLS, authentication, or delivery stage.
+
+When `SMTP_HOST` and Resend are both configured, Multica prefers SMTP. For configuration, see [Sign-in and signup](/auth-setup#email-verification-codes).
+
+<Callout type="warning">
+Do not rely on codes in the log in production, and do not enable the fixed local test code.
+</Callout>
+
+## Attachment uploads or downloads fail
+
+Check the backend log and the response status code first. Common causes:
+
+- The reverse proxy limits request body size.
+- The local upload directory is not writable or has no persistent volume mounted.
+- The S3 bucket, region, endpoint, or credentials do not match.
+- The download URL uses the wrong public domain or protocol after passing through a proxy.
+
+With Docker Compose, the default `backend_uploads` volume stores local attachments. Recreating containers does not delete it, but `docker compose down -v` deletes the data volume. For S3 configuration, see [Environment variables](/environment-variables#attachment-storage).
+
+## Usage shows zero
+
+The Usage page reads hourly rollups, not each run's raw usage. Check the raw data and the rollup table first:
+
+```sql
+SELECT count(*) FROM task_usage;
+SELECT count(*) FROM task_usage_hourly;
+
+SELECT plan_time, status, error_code, error_msg
+FROM sys_cron_executions
+WHERE job_name = 'rollup_task_usage_hourly'
+ORDER BY plan_time DESC
+LIMIT 20;
+```
+
+If `task_usage` has rows, the rollup table is empty, and the scheduler records show failures, first confirm all migrations have been applied; if migration 103 rejected the upgrade, see the next section. You can also run one rollup by hand to separate SQL problems from scheduling problems:
+
+```sql
+SELECT rollup_task_usage_hourly();
+```
+
+If the numbers look right after a manual run, the rollup function works and the problem is the backend's built-in scheduling; manual SQL only fills in one rollup and does not restore scheduling. Hourly rollups are executed by the backend's built-in scheduler — you do not need to configure pg_cron yourself.
+
+## Migration 103 blocks an upgrade
+
+A normal upgrade needs no action for 103: `migrate up` automatically backfills historical usage data before applying it — an empty database passes straight through, and instances with history are backfilled month by month before continuing.
+
+If the backend still fails to start with `refusing to drop legacy daily rollups`, the automatic backfill did not complete (for example, it failed partway, or the SQL was applied directly instead of through `migrate up`). Run the backfill command manually, then restart the backend:
+
+```bash
+cd server
+DATABASE_URL='postgres://...' go run ./cmd/backfill_task_usage_hourly
+```
+
+Useful flags: `--dry-run` previews without writing; `--sleep-between-slices` adds a pause between slices to reduce read pressure on a busy instance. The command works in monthly slices and is idempotent — rerun it directly after an interruption. It holds an advisory lock and is mutually exclusive with the server's scheduled rollup, so it cannot produce duplicate or inconsistent rollup data. When it finishes, restart the backend and confirm `migrations` is `ok` on `/readyz`.
+
+## Port already in use
+
+Common local ports are `8080` for the API, `3000` for the web app, and the daemon health-check port. Find the process holding the port first:
+
+```bash
+lsof -nP -iTCP:8080 -sTCP:LISTEN   # macOS / Linux
+netstat -ano | findstr :8080       # Windows
+```
+
+If it is another Multica checkout, run `make stop` in that directory first. Otherwise stop the offending program normally, or change the current service's port. Public ports 80/443 are listened on by a reverse proxy such as Caddy or Nginx.
+
+## Log locations
+
+| Component | How to view |
+| --- | --- |
+| Background daemon | `multica daemon logs --lines 100` |
+| Follow daemon logs live | `multica daemon logs --follow` |
+| Default profile's log file | `~/.multica/daemon.log` |
+| Default profile's startup or crash log | `~/.multica/daemon.err.log` |
+| Named profiles | the matching logs under `~/.multica/profiles/<name>/` |
+| Docker backend | `docker compose -f docker-compose.selfhost.yml logs -f backend` |
+| Browser | Console and Network in the developer tools |
+
+Which of those files is the live one depends on the profile the daemon was started with, and a stale log from an earlier daemon still reads perfectly — the easiest way to debug the wrong file. Don't open one by guess: `multica daemon logs` prints the absolute path it resolved before streaming it. Add `--profile <name>` to read a named profile's log.
+
+To observe the daemon's startup directly, run it in the foreground instead:
+
+```bash
+multica daemon stop
+multica daemon start --foreground
+```
+
+If you still cannot pin it down, search existing issues or file a new one on [GitHub Issues](https://github.com/multica-ai/multica/issues).
+
+## Next steps
+
+- [Daemon and runtimes](/daemon-runtimes) — how runtimes register and report online status.
+- [Runs](/tasks) — status, timeout, and failure reference.
+- [Environment variables](/environment-variables) — the full self-hosting configuration reference.

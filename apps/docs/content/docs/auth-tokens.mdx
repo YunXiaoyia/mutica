@@ -1,0 +1,101 @@
+---
+title: Authentication and tokens
+description: Understand browser sign-in sessions, personal access tokens, and the temporary credentials agents use during runs.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+In day-to-day use of Multica you mainly deal with two kinds of credentials: browser sign-in sessions and personal access tokens. Browser sessions serve web and Desktop; personal access tokens serve the CLI, the daemon, scripts, and the API.
+
+## Browser sign-in sessions
+
+After signing in with an email verification code or Google, Multica stores a JWT in an HttpOnly cookie named `multica_auth`. The browser sends it automatically; JavaScript cannot read it directly.
+
+By default a session lasts 30 days, but that is not a countdown from sign-in: a session in continuous use is re-issued before it expires, so staying signed in does not require signing in again on a schedule. It is only re-issued once it is past the halfway point of its lifetime, so a session left unused can end sooner than 30 days after its last use. Self-hosting admins can adjust the lifetime with `AUTH_TOKEN_TTL`; see [Sign-in and signup configuration](/auth-setup#session-lifetime). Logging out clears the auth and CSRF cookies in the current browser.
+
+Browser cookies are not meant to be copied into scripts or the CLI; use a personal access token to access Multica from a terminal.
+
+## Personal access tokens
+
+A personal access token (PAT) starts with `mul_` and represents your account. It can access every workspace and API you have access to, so guard it like a password.
+
+When creating a token under **Settings → API Token**, you provide a name and pick an expiry of 30 days, 90 days, 1 year, or never; 90 days is preselected. The full token is shown exactly once; after the dialog closes, Multica keeps only:
+
+- the token's hash;
+- the first few characters, for identification;
+- the name, creation time, expiry, and last-used time.
+
+The full value cannot be recovered. If you lose it, revoke the old token and create a new one.
+
+<Callout type="warning">
+Don't put a PAT in repositories, issues, comments, screenshots, or logs, and don't pass it directly in shell commands that get saved.
+</Callout>
+
+## The CLI and PATs
+
+When you run `multica login`, the CLI completes sign-in through the browser, then creates a PAT valid for 90 days and saves it to the current profile's config file:
+
+```text
+~/.multica/config.json
+~/.multica/profiles/<name>/config.json
+```
+
+The daemon connects to Multica with the same PAT. A `mul_` PAT with an expiry renews automatically when less than 7 days remain, extending it to 90 days from that moment. A failed renewal leaves the token unchanged; once a token has expired or been revoked, run `multica login` again.
+
+On a machine without a browser, create a PAT on the web first and let the CLI prompt for it safely:
+
+```bash
+multica login --token
+```
+
+## Using a PAT in API requests
+
+Put the PAT in the `Authorization` header:
+
+```bash
+export MULTICA_TOKEN='mul_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+curl https://api.multica.ai/api/me \
+  -H "Authorization: Bearer $MULTICA_TOKEN"
+```
+
+Workspace-level API calls also need the workspace, as required by the endpoint:
+
+```bash
+curl https://api.multica.ai/api/issues \
+  -H "Authorization: Bearer $MULTICA_TOKEN" \
+  -H "X-Workspace-ID: $MULTICA_WORKSPACE_ID"
+```
+
+In scripts, take the token from a secret manager or a protected environment variable — never hardcode it. On self-hosted instances, replace the domain with your own public API address.
+
+## Logging out and revocation
+
+`multica auth logout` only deletes the PAT saved in the current CLI profile; logging out on the web only deletes the current browser's cookies. Neither revokes the personal access token on the server.
+
+If a token may have leaked, revoke it immediately under **Settings → API Token**. Once revoked, the PAT can never be used again, and any other machines and scripts that saved it lose access too.
+
+## Temporary tokens for agent runs
+
+When the daemon claims a run, the server creates a temporary token for that run, prefixed with `mat_`. It is bound to the current user, workspace, agent, and run, is valid for at most 24 hours, and is cleaned up when the run ends.
+
+The daemon injects this temporary token into the AI coding tool instead of handing the user's PAT to the agent. Requests made by the agent are therefore recorded as agent actions, and the token can't be used to reach sensitive operations restricted to users or owners.
+
+These tokens are created automatically by the server; users never need to save or manage them.
+
+## Other machine credentials
+
+The server also recognizes two credentials used in internal or managed scenarios:
+
+| Prefix | Purpose | Managed by |
+| --- | --- | --- |
+| `mcn_` | Multica Cloud Node connections | Multica Cloud Fleet |
+| `mdt_` | Workspace-scoped daemon authentication protocol | Internal server flows |
+
+Regular Cloud, self-hosted, and Desktop installations never need to create them manually. The user-side CLI and daemon always use `mul_` PATs; don't construct tokens with other prefixes yourself.
+
+## Next steps
+
+- [Using the CLI](/cli) — `login`, `auth status`, and profile configuration.
+- [Daemon and runtimes](/daemon-runtimes) — where PAT renewal happens.
+- [Sign-in and signup configuration](/auth-setup) — server-side configuration for session lifetime and signup restrictions.

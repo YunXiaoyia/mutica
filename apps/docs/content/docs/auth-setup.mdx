@@ -1,0 +1,162 @@
+---
+title: Sign-in and signup
+description: Configure email verification codes, Google sign-in, and who can sign up.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica signs users in with email verification codes by default; Google OAuth can be added on top. Existing users can always sign in again — signup restrictions only decide whether new accounts can be created.
+
+## Email verification codes
+
+After the user enters an email address, Multica sends a 6-digit verification code. The code is valid for 10 minutes; once it verifies, the browser receives a sign-in cookie.
+
+Email can be delivered through Resend or SMTP. When both are configured, `SMTP_HOST` takes priority.
+
+### Using Resend
+
+1. Verify a sending domain and create an API key at [Resend](https://resend.com/).
+2. Set:
+
+   ```dotenv
+   RESEND_API_KEY=re_xxxxxxxxxxxxxxxx
+   RESEND_FROM_EMAIL=noreply@example.com
+   ```
+
+3. Restart the API service.
+
+`RESEND_FROM_EMAIL` must belong to a domain already verified in Resend.
+
+### Using SMTP
+
+At minimum, set the host and sender address:
+
+```dotenv
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=multica
+SMTP_PASSWORD=<password>
+SMTP_FROM_EMAIL=noreply@example.com
+```
+
+Common connection modes:
+
+| Scenario | Configuration |
+|---|---|
+| Internal anonymous relay | `SMTP_PORT=25`, leave username and password empty |
+| STARTTLS | `SMTP_PORT=587`; upgrades to TLS by default when the server supports it |
+| Implicit TLS | `SMTP_PORT=465`, or set `SMTP_TLS=implicit` explicitly |
+
+If `SMTP_FROM_EMAIL` is unset, it falls back to `RESEND_FROM_EMAIL`. Private CAs or self-signed certificates require adding the CA to the container trust store; `SMTP_TLS_INSECURE=true` skips certificate verification and should only be used temporarily on a trusted internal network.
+
+Some strict relays also require a valid EHLO name:
+
+```dotenv
+SMTP_EHLO_NAME=mail.example.com
+```
+
+### Behavior without an email service
+
+The server still starts, but verification codes and invitation links are only written to the log; no email is sent. This suits local development, not production.
+
+The startup log states whether the current mode is `Resend API`, `SMTP relay`, or `DEV mode`.
+
+## Fixed local verification code
+
+Local automated tests can set a fixed verification code:
+
+```dotenv
+APP_ENV=development
+MULTICA_DEV_VERIFICATION_CODE=888888
+```
+
+The code must be 6 digits. The fixed code is ignored when `APP_ENV=production`.
+
+<Callout type="warning">
+Do not enable a fixed code on a publicly reachable instance. The production combination is `APP_ENV=production` with an empty `MULTICA_DEV_VERIFICATION_CODE`.
+</Callout>
+
+## Google sign-in
+
+1. Create an OAuth 2.0 client in the [Google Cloud Console](https://console.cloud.google.com/).
+2. Add the Multica frontend's callback URL to **Authorized redirect URIs**:
+
+   ```text
+   https://multica.example.com/auth/callback
+   ```
+
+3. Set:
+
+   ```dotenv
+   GOOGLE_CLIENT_ID=xxxxx.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxx
+   GOOGLE_REDIRECT_URI=https://multica.example.com/auth/callback
+   ```
+
+4. Restart the API service.
+
+The URLs in the Google Console and in `GOOGLE_REDIRECT_URI` must match exactly, including protocol, port, and trailing slash. Once configured, the sign-in page shows a Google sign-in button; the frontend image needs no rebuild.
+
+## Signup restrictions
+
+Three variables together decide whether a new account can be created:
+
+| Variable | Effect |
+|---|---|
+| `ALLOWED_EMAILS` | Full email addresses allowed to sign up, comma-separated |
+| `ALLOWED_EMAIL_DOMAINS` | Email domains allowed to sign up, comma-separated |
+| `ALLOW_SIGNUP` | Whether signup is allowed when no allowlist is configured; defaults to `true` |
+
+The evaluation order is:
+
+1. The email matches `ALLOWED_EMAILS` — allow.
+2. Or its domain matches `ALLOWED_EMAIL_DOMAINS` — allow.
+3. With no match, if `ALLOW_SIGNUP=false` — reject.
+4. With `ALLOW_SIGNUP=true` but any allowlist configured and no match — still reject.
+5. With no allowlist configured and `ALLOW_SIGNUP=true` — allow.
+
+Common configurations:
+
+```dotenv
+# Company domain only
+ALLOW_SIGNUP=false
+ALLOWED_EMAIL_DOMAINS=company.com
+
+# Also admit one external collaborator
+ALLOWED_EMAILS=partner@example.net
+```
+
+<Callout type="info">
+Both allowlists also work as an explicit exception list when `ALLOW_SIGNUP=false`.
+</Callout>
+
+## Invitations and signup restrictions
+
+Invitations do not automatically bypass signup restrictions:
+
+- If the invitee already has a Multica account, they can sign in and accept the invitation.
+- If they do not, their email must satisfy the signup rules above.
+
+To invite a new member on an instance with open signup disabled, add their email to `ALLOWED_EMAILS` first. Once the account is created and the invitation accepted, you can remove the entry again.
+
+## Session lifetime
+
+Sessions slide. The lifetime below is an **idle** bound, not a countdown from sign-in: once a session drops below half of it, the next request re-issues it with a full lifetime again, so an account in continuous use is never signed out on a schedule. There is no absolute cap.
+
+The bound is one-sided. A session is only re-issued once it is past the halfway point, so a session last used while it still had more than half its lifetime left is not extended — the idle gap that is always survivable is half the value below, not all of it.
+
+Adjust with `AUTH_TOKEN_TTL`, which accepts a Go duration or a positive integer of seconds:
+
+```dotenv
+AUTH_TOKEN_TTL=720h
+```
+
+The minimum is `60s`; anything shorter is clamped up to it and logs a warning at startup. Below that, the renewal cadence the server derives would fall under the floor clients apply to it, and clients would check for renewal less often than the session can survive.
+
+Restart the API service after changing it. The value applies to sessions issued or re-issued afterwards — because sessions slide, an existing session picks up the new lifetime the next time it is re-issued.
+
+## Next steps
+
+- [Environment variables](/environment-variables) — the full variable reference.
+- [Authentication and tokens](/auth-tokens) — sign-in sessions and token types.
+- [Members and roles](/members-roles) — invitations and roles.

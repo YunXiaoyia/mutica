@@ -1,0 +1,83 @@
+# --- Dependencies ---
+FROM node:22-alpine AS deps
+
+WORKDIR /app
+
+# Copy workspace config and all package.json files for dependency resolution
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json turbo.json .npmrc ./
+COPY apps/web/package.json apps/web/
+# postinstall runs fumadocs-mdx which reads apps/web/source.config.ts
+COPY apps/web/source.config.ts apps/web/source.config.ts
+COPY packages/core/package.json packages/core/
+COPY packages/ui/package.json packages/ui/
+COPY packages/views/package.json packages/views/
+COPY packages/tsconfig/package.json packages/tsconfig/
+COPY packages/eslint-config/package.json packages/eslint-config/
+
+RUN corepack enable && \
+    PNPM_VERSION="$(node -p 'require("./package.json").packageManager')" && \
+    corepack prepare "$PNPM_VERSION" --activate
+RUN pnpm install --frozen-lockfile
+
+# --- Build ---
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+# Activate the same pnpm version declared by the repository before the
+# offline frozen install validates package-manager metadata in pnpm-lock.yaml.
+COPY package.json ./
+RUN corepack enable && \
+    PNPM_VERSION="$(node -p 'require("./package.json").packageManager')" && \
+    corepack prepare "$PNPM_VERSION" --activate
+
+# Copy installed dependencies (preserves pnpm symlink structure)
+COPY --from=deps /app ./
+
+# Copy source
+COPY package.json turbo.json pnpm-workspace.yaml ./
+COPY apps/web/ apps/web/
+COPY packages/ packages/
+
+# Re-link after source overlay (fixes any symlinks overwritten by COPY)
+RUN pnpm install --frozen-lockfile --offline
+
+ARG NEXT_PUBLIC_APP_VERSION=dev
+ENV NEXT_PUBLIC_APP_VERSION=$NEXT_PUBLIC_APP_VERSION
+ENV STANDALONE=true
+
+# Build the web app (standalone output for minimal runtime)
+RUN pnpm --filter @multica/web build
+
+# --- Runtime ---
+FROM node:22-alpine AS runner
+
+WORKDIR /app
+
+# Alpine openssl security fixes (CVE-2026-63073, CVE-2026-75803).
+# Floor pins the fix so the build fails instead of silently shipping the CVEs.
+# Remove once node:22-alpine includes libssl3 >= 3.5.8-r0.
+RUN apk add --no-cache "libcrypto3>=3.5.8-r0" "libssl3>=3.5.8-r0"
+
+ENV NODE_ENV=production
+ENV REMOTE_API_URL=http://backend:8080
+
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+# Copy standalone output (includes traced node_modules)
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/standalone ./
+# Copy static files (not included in standalone)
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/static ./apps/web/.next/static
+# Copy public assets
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/public ./apps/web/public
+# Ship the license and attribution notices with the image (LICENSE condition 1b)
+COPY --chown=nextjs:nodejs LICENSE NOTICE ./
+
+USER nextjs
+
+EXPOSE 3000
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+CMD ["node", "apps/web/server.js"]

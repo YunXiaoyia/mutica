@@ -1,0 +1,346 @@
+// Package taskfailure is the canonical, refined taxonomy of values written
+// into agent_task_queue.failure_reason and chat_message.failure_reason.
+//
+// History: until MUL-1949, server/daemon code wrote one of a small handful
+// of coarse failure_reason values ("agent_error", "timeout",
+// "runtime_offline", …). The "agent_error" bucket grew to ~30% of all
+// failures and hid the real cause (provider 401, quota exceeded, context
+// overflow, runner crash, etc.) inside the free-form `error` text column.
+// MUL-1949's offline backfill SQL re-classified those rows into 14
+// agent_error.* sub-reasons via a CASE expression on the error text.
+//
+// This package lifts that classifier into the in-flight write path so the
+// stored failure_reason is already refined when the row is first
+// persisted, and so server / daemon / cloud share a single source of
+// truth for the canonical values. PR1 of the Grafana board plan
+// ([MUL-2946](https://multica/issues/MUL-2946)). Subsequent PRs use
+// AllReasons() to pre-warm the Prometheus failure_reason label set.
+//
+// The canonical values fall into two groups:
+//
+//   - Platform-side values (no `agent_error.` prefix) emitted by the
+//     server-side sweepers and daemon classifiers when the failure is
+//     attributable to the platform/scheduler/runtime layer rather than
+//     anything the agent process did:
+//
+//     queued_expired, runtime_offline, runtime_reconnect_timeout,
+//     runtime_recovery, timeout, iteration_limit, agent_blocked,
+//     api_invalid_request, skill_bundle_unavailable,
+//     runtime_cli_timeout, environment_prepare_failed,
+//     invalid_task_identity, runtime_access_denied
+//
+//   - 14 agent-side values (with `agent_error.` prefix) produced by
+//     Classify(rawError) when the agent process surfaced an error string.
+//     IsAgentError reports membership in this set.
+//
+// Wire stability: the string forms of these constants are persisted into
+// the database and surfaced as Prometheus labels. Renaming a value is a
+// breaking change. New classifier-derived values also require a matching SQL
+// backfill rule; new platform-side events may be added directly because no
+// historical rows need reclassification.
+package taskfailure
+
+import "strings"
+
+// Reason is a string-backed enum of the canonical failure_reason values
+// stored in agent_task_queue.failure_reason. Use the Reason* constants
+// rather than string literals so the compiler catches typos and a future
+// taxonomy change can be made package-wide.
+type Reason string
+
+// agentErrorPrefix marks the 14 sub-reasons that originate inside the
+// agent process (provider error, runner crash, context overflow, etc.)
+// as opposed to the platform-side reasons (queue expiry, runtime
+// offline, sweeper timeout, etc.). IsAgentError uses this prefix so
+// callers don't have to enumerate the agent-side reasons by hand.
+const agentErrorPrefix = "agent_error."
+
+const (
+	// Platform / scheduler side: failure attributable to Multica
+	// infrastructure rather than anything the agent process did. These
+	// are emitted by server-side sweepers (ExpireStaleQueuedTasks,
+	// FailStaleTasks, FailTasksForOfflineRuntimes,
+	// RecoverOrphanedTasksForRuntime) and the daemon's poisoned-session
+	// classifier (api_invalid_request, iteration_limit, agent_blocked).
+	// IsAgentError returns false for all of these.
+
+	// ReasonQueuedExpired: task sat in 'queued' past the TTL without
+	// being claimed (typically autopilot backlog while the assignee's
+	// runtime is offline). Written by ExpireStaleQueuedTasks.
+	ReasonQueuedExpired Reason = "queued_expired"
+
+	// ReasonRuntimeOffline: the runtime owning a dispatched/running
+	// task went offline. Written by FailTasksForOfflineRuntimes.
+	ReasonRuntimeOffline Reason = "runtime_offline"
+
+	// ReasonRuntimeReconnectTimeout: a retry waiting for an offline runtime
+	// remained deferred for the full reconnect grace. Non-retryable: the
+	// runtime must return before a user starts another attempt. Written by
+	// FailExpiredRuntimeReconnectRetries.
+	ReasonRuntimeReconnectTimeout Reason = "runtime_reconnect_timeout"
+
+	// ReasonRuntimeRecovery: the daemon restarted while the task was
+	// in flight; the prior session is unrecoverable. Written by
+	// RecoverOrphanedTasksForRuntime at daemon startup.
+	ReasonRuntimeRecovery Reason = "runtime_recovery"
+
+	// ReasonTimeout: server-side or runtime-side hard timeout.
+	// Written by FailStaleTasks (server) and the daemon's per-task
+	// agent timeout path.
+	ReasonTimeout Reason = "timeout"
+
+	// ReasonIterationLimit: the agent reached its per-run iteration
+	// cap and emitted a fallback "I reached the iteration limit"
+	// message. Treated as platform-side because it is a Multica-imposed
+	// budget rather than an external API rejection.
+	ReasonIterationLimit Reason = "iteration_limit"
+
+	// ReasonAgentBlocked: the agent intentionally entered the
+	// 'blocked' workflow state (e.g. requesting human input). Not a
+	// system error.
+	ReasonAgentBlocked Reason = "agent_blocked"
+
+	// ReasonAPIInvalidRequest: the upstream LLM API rejected the
+	// request body with a 400 invalid_request_error (oversized image,
+	// malformed payload, etc.). The conversation history itself is
+	// poisoned, so the next task on the same session would replay the
+	// same 400 — GetLastTaskSession excludes this reason from the
+	// resume lookup. Written by classifyPoisonedError in daemon/poisoned.go.
+	ReasonAPIInvalidRequest Reason = "api_invalid_request"
+
+	// ReasonSkillBundleUnavailable: the daemon could not download the
+	// agent's skill bundles from the control plane during task
+	// preparation — the agent process was never launched. Platform-side
+	// because nothing the agent did caused it: the usual triggers are a
+	// slow/blocked link to the API or a daemon that inherited no proxy
+	// configuration (MUL-5370). Retryable, and cheap to retry: every
+	// bundle that *did* arrive is cached on disk, so successive attempts
+	// converge instead of re-downloading the whole set. Written by
+	// taskRunFailureReason in daemon/daemon.go.
+	ReasonSkillBundleUnavailable Reason = "skill_bundle_unavailable"
+
+	// ReasonRuntimeCLITimeout: a local runtime CLI the daemon must call
+	// during task preparation did not answer within its deadline — today
+	// that is OpenClaw config discovery (`openclaw config file`), which on
+	// a slow host takes 8-11s against a deadline that used to be 5s
+	// (#7112). Platform-side: the agent process was never launched and no
+	// provider was contacted. Deliberately NOT retryable — the stall is
+	// local and deterministic, so retrying re-pays the same wall-clock and
+	// fails identically. The user-facing fix is to raise
+	// MULTICA_OPENCLAW_CLI_TIMEOUT or speed the CLI up, which is why the
+	// copy names the CLI instead of blaming the network. Written by
+	// taskRunFailureReason in daemon/daemon.go.
+	ReasonRuntimeCLITimeout Reason = "runtime_cli_timeout"
+
+	// ReasonEnvironmentPrepareFailed: the daemon could not build or re-open
+	// the task's execution environment on this host, so the agent process was
+	// never launched.
+	//
+	// That phase is everything execenv.Prepare / Reuse does before launch —
+	// the workspace directory and its overlay homes, AND the per-provider
+	// local config written or validated inside it (Codex home, Hermes
+	// overlay, Cursor MCP, OpenClaw config, which fails closed on a config
+	// the CLI cannot read). So the causes are wider than a disk fault: a full
+	// volume, a read-only or permission-denied workspaces root, a directory
+	// another process still holds open (Windows) and an I/O error all land
+	// here, and so does a malformed local runtime config. What they share is
+	// the machine — every one is fixed on the host running the daemon, and
+	// the raw error is what names which step failed.
+	//
+	// Copy that narrows this to "check your disk" therefore sends the user
+	// past half the real causes, which is the same defect in miniature that
+	// this reason exists to fix. Read the wording in the chat bundles and the
+	// docs failure-reason table as part of the contract.
+	//
+	// Platform-side, and that is the point (#7913). Before this reason
+	// existed the wrapped OS error went through Classify — a classifier
+	// written to read agent and provider output — and landed somewhere in
+	// agent_error.*: today the catchall, historically provider_server_error,
+	// which sent one report's diagnosis at an LLM vendor for hours. The task
+	// never reached an agent, so no value in that namespace can be correct,
+	// and any fleet health read grouping by the agent_error.* prefix
+	// over-reports agent problems by exactly these rows.
+	//
+	// Deliberately NOT retryable: a full disk or a denied permission
+	// reproduces identically on the next attempt, and preparation already
+	// waits out the one transient case it knows about (a prior run still
+	// holding the directory) before it fails. Written by
+	// taskRunFailureReason in daemon/daemon.go; resume-safe, because no
+	// session was touched.
+	ReasonEnvironmentPrepareFailed Reason = "environment_prepare_failed"
+
+	// ReasonInvalidTaskIdentity: the daemon refused a claimed task because
+	// the task row's authoritative agent_id was absent or disagreed with the
+	// nested agent payload. The agent process is never launched. This is
+	// deliberately non-retryable: retrying the same contradictory claim would
+	// only repeat an isolation failure.
+	ReasonInvalidTaskIdentity Reason = "invalid_task_identity"
+
+	// ReasonRuntimeAccessDenied: the daemon refused a claimed task because
+	// a private runtime does not authorize the task's agent — the runtime
+	// owner and the agent owner differ, a private owned runtime was paired
+	// with an ownerless agent, or the runtime owner needed for
+	// authorization was missing at the delivery gate. The agent process is
+	// never launched. Unlike ReasonInvalidTaskIdentity the task's persisted
+	// identity is intact; what fails is ownership authorization. Permanent
+	// and non-retryable: retrying the same runtime/agent pair reproduces
+	// the denial, so recovery is user configuration (make the runtime
+	// public, or rebind the agent to a runtime its owner may use), not
+	// another attempt. Written by the daemon claim settlement paths in
+	// handler/daemon.go. Shares the runtime_access_denied wire value with
+	// dispatch.ReasonRuntimeAccessDenied so admission blocks and persisted
+	// settlement failures surface the same recovery guidance.
+	ReasonRuntimeAccessDenied Reason = "runtime_access_denied"
+
+	// Agent process side: failure surfaced by the agent CLI / SDK as
+	// an error string. Classify(rawError) is responsible for picking
+	// the right sub-reason from the string. IsAgentError returns true
+	// for all of these.
+
+	// ReasonAgentProviderAuthOrAccess: 401 / 403, "Not logged in",
+	// invalid API key, no access to the model. Not retryable; user
+	// must re-auth.
+	ReasonAgentProviderAuthOrAccess Reason = "agent_error.provider_auth_or_access"
+
+	// ReasonAgentProviderQuotaLimit: 402, insufficient_balance,
+	// monthly usage limit, credits exhausted. Not retryable until the
+	// account is topped up.
+	ReasonAgentProviderQuotaLimit Reason = "agent_error.provider_quota_limit"
+
+	// ReasonAgentProviderCapacityOrRateLimit: 429 / 529, rate-limited,
+	// overloaded, no capacity available. Transient — backoff +
+	// retry is appropriate.
+	ReasonAgentProviderCapacityOrRateLimit Reason = "agent_error.provider_capacity_or_rate_limit"
+
+	// ReasonAgentProviderServerError: provider 5xx, internal error,
+	// service unavailable, bad gateway. Transient — short backoff.
+	ReasonAgentProviderServerError Reason = "agent_error.provider_server_error"
+
+	// ReasonAgentProviderNetwork: stream disconnected, dial tcp
+	// failures, DNS failures, i/o timeout. Transient.
+	ReasonAgentProviderNetwork Reason = "agent_error.provider_network"
+
+	// ReasonAgentProcessFailure: agent subprocess exited non-zero,
+	// crashed, or returned an unexpected signal. Runner / backend
+	// quality issue.
+	ReasonAgentProcessFailure Reason = "agent_error.process_failure"
+
+	// ReasonAgentEmptyOrUnparseableOutput: the agent CLI returned
+	// empty output or output we couldn't parse against its known
+	// protocol. Wrapper / protocol robustness issue.
+	ReasonAgentEmptyOrUnparseableOutput Reason = "agent_error.empty_or_unparseable_output"
+
+	// ReasonAgentTimeout: the agent subprocess hit its hard timeout
+	// (e.g. 2h) — distinct from ReasonTimeout, which is a
+	// platform-side sweeper timeout.
+	ReasonAgentTimeout Reason = "agent_error.agent_timeout"
+
+	// ReasonAgentContextOverflow: prompt or context window exceeded
+	// the model's limit. Not retryable on the same session; needs
+	// compaction or a fresh session.
+	ReasonAgentContextOverflow Reason = "agent_error.context_overflow"
+
+	// ReasonAgentMissingConfig: the agent / runtime is missing a
+	// required environment variable or API key, or no LLM provider
+	// is configured.
+	ReasonAgentMissingConfig Reason = "agent_error.missing_config"
+
+	// ReasonAgentModelNotFoundOrUnavailable: the chosen model id
+	// doesn't exist, isn't accessible to this account, or returned
+	// HTTP 404 from the provider.
+	ReasonAgentModelNotFoundOrUnavailable Reason = "agent_error.model_not_found_or_unavailable"
+
+	// ReasonAgentRuntimeVersionUnsupported: the local runner CLI is
+	// below the minimum supported version or the protocol isn't
+	// compatible.
+	ReasonAgentRuntimeVersionUnsupported Reason = "agent_error.runtime_version_unsupported"
+
+	// ReasonAgentRuntimeMissingExecutable: the runner CLI binary
+	// isn't installed / not on PATH.
+	ReasonAgentRuntimeMissingExecutable Reason = "agent_error.runtime_missing_executable"
+
+	// ReasonAgentUnknown: the classifier couldn't match any rule.
+	// This bucket is expected to be small (<5% of failed tasks) — a
+	// rising share is a signal that the classifier needs new rules.
+	// Returned by Classify when no other rule fires (including for
+	// empty input).
+	ReasonAgentUnknown Reason = "agent_error.unknown"
+)
+
+// allReasons is the canonical ordered list of the 27 reasons. Order is
+// stable so callers (e.g. Prometheus collectors that pre-warm series via
+// AllReasons) can build deterministic label sets across restarts.
+//
+// Ordering:
+//  1. Platform-side reasons in the same order they tend to fire in a
+//     task lifecycle (queue → dispatch → run → post-run).
+//  2. Agent-side reasons grouped by responsibility area (provider /
+//     agent process / config / runtime), then unknown last.
+var allReasons = []Reason{
+	// Platform / scheduler side.
+	ReasonQueuedExpired,
+	ReasonRuntimeOffline,
+	ReasonRuntimeReconnectTimeout,
+	ReasonRuntimeRecovery,
+	ReasonTimeout,
+	ReasonIterationLimit,
+	ReasonAgentBlocked,
+	ReasonAPIInvalidRequest,
+	ReasonSkillBundleUnavailable,
+	ReasonRuntimeCLITimeout,
+	ReasonEnvironmentPrepareFailed,
+	ReasonInvalidTaskIdentity,
+	ReasonRuntimeAccessDenied,
+
+	// Agent process side: provider errors.
+	ReasonAgentProviderAuthOrAccess,
+	ReasonAgentProviderQuotaLimit,
+	ReasonAgentProviderCapacityOrRateLimit,
+	ReasonAgentProviderServerError,
+	ReasonAgentProviderNetwork,
+
+	// Agent process side: agent / runner errors.
+	ReasonAgentProcessFailure,
+	ReasonAgentEmptyOrUnparseableOutput,
+	ReasonAgentTimeout,
+	ReasonAgentContextOverflow,
+	ReasonAgentMissingConfig,
+	ReasonAgentModelNotFoundOrUnavailable,
+	ReasonAgentRuntimeVersionUnsupported,
+	ReasonAgentRuntimeMissingExecutable,
+
+	// Catchall.
+	ReasonAgentUnknown,
+}
+
+// String returns the wire form of the reason — what gets written to the
+// failure_reason column and exposed as a Prometheus label value.
+func (r Reason) String() string { return string(r) }
+
+// IsAgentError reports whether the reason originates inside the agent
+// process (provider error, runner crash, context overflow, etc.) as
+// opposed to the platform/scheduler/runtime layer (queue expiry, runtime
+// offline, sweeper timeout, etc.).
+//
+// The classification is intentionally based on a string prefix rather
+// than an enum membership test: any future agent_error.* value
+// automatically inherits the correct grouping without needing to update
+// this method.
+func (r Reason) IsAgentError() bool {
+	return strings.HasPrefix(string(r), agentErrorPrefix)
+}
+
+// AllReasons returns the canonical reasons in a stable order. The
+// caller MUST NOT mutate the returned slice; a copy is returned so
+// concurrent callers can append to their local copy without corrupting
+// the package-level fixture.
+//
+// Primary use: Prometheus failure_reason label pre-warming, so a label
+// the production process has not seen yet is still observable as a
+// zero-valued series instead of appearing only after the first failure
+// of that kind.
+func AllReasons() []Reason {
+	out := make([]Reason, len(allReasons))
+	copy(out, allReasons)
+	return out
+}

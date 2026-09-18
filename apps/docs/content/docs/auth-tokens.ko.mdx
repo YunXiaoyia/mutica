@@ -1,0 +1,101 @@
+---
+title: 인증과 토큰
+description: 브라우저 로그인, 개인 액세스 토큰, 에이전트 실행에 사용하는 임시 자격 증명을 알아봅니다.
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica를 일상적으로 사용할 때 주로 접하는 자격 증명은 브라우저 로그인 세션과 개인 액세스 토큰 두 가지입니다. 브라우저 세션은 Web과 Desktop에서 사용하고 개인 액세스 토큰은 CLI, 데몬, 스크립트, API에서 사용합니다.
+
+## 브라우저 로그인 세션
+
+이메일 인증 코드 또는 Google로 로그인하면 Multica가 JWT를 `multica_auth`라는 HttpOnly cookie에 저장합니다. 브라우저가 자동으로 함께 보내며 JavaScript에서는 직접 읽을 수 없습니다.
+
+세션은 기본적으로 30일 동안 유효하지만 로그인 시점부터의 카운트다운은 아닙니다. 계속 사용하는 세션은 만료 전에 다시 발급되므로 주기적으로 다시 로그인할 필요가 없습니다. 다시 발급은 유효 기간의 절반이 지난 뒤에만 일어나므로, 사용하지 않는 세션은 마지막 사용 후 30일이 되기 전에 만료될 수 있습니다. 자체 호스팅 관리자는 `AUTH_TOKEN_TTL`로 유효 기간을 조정할 수 있습니다. [로그인과 가입](/auth-setup#로그인-유효-기간)을 참고하세요. 로그아웃하면 현재 브라우저의 인증 및 CSRF cookie가 삭제됩니다.
+
+브라우저 cookie는 스크립트나 CLI에 복사하기에 적합하지 않습니다. 터미널에서 Multica에 접근할 때는 개인 액세스 토큰을 사용하세요.
+
+## 개인 액세스 토큰
+
+개인 액세스 토큰(PAT)은 `mul_`로 시작하며 사용자 계정을 나타냅니다. 사용자가 접근할 권한이 있는 모든 워크스페이스와 API에 접근할 수 있으므로 비밀번호처럼 보관해야 합니다.
+
+**설정 → API Token**에서 토큰을 만들 때 이름을 입력하고 30일, 90일, 1년, 만료 없음 중 하나를 선택합니다. 기본값은 90일입니다. 전체 토큰은 한 번만 표시됩니다. 창을 닫은 뒤 Multica에는 다음 정보만 남습니다.
+
+- 토큰의 hash
+- 토큰을 식별하는 앞부분 몇 글자
+- 이름, 생성 시간, 만료 시간, 최근 사용 시간
+
+전체 값을 다시 확인할 수 없으므로 잃어버리면 이전 토큰을 취소하고 새로 만드세요.
+
+<Callout type="warning">
+PAT를 저장소, 태스크, 댓글, 스크린샷, 로그에 넣지 마세요. 저장되는 shell 명령에 직접 입력해서도 안 됩니다.
+</Callout>
+
+## CLI와 PAT
+
+`multica login`을 실행하면 CLI가 브라우저에서 로그인을 완료한 뒤 90일 동안 유효한 PAT를 만들고 현재 profile의 설정 파일에 저장합니다.
+
+```text
+~/.multica/config.json
+~/.multica/profiles/<name>/config.json
+```
+
+데몬도 같은 PAT로 Multica에 연결합니다. 만료 시간이 있는 `mul_` PAT는 남은 유효 기간이 7일 미만이면 자동으로 갱신되어 그 시점부터 90일 뒤까지 연장됩니다. 갱신 실패는 토큰 자체를 바꾸지 않습니다. 토큰이 이미 만료되었거나 취소되었다면 `multica login`을 다시 실행해야 합니다.
+
+브라우저가 없는 환경에서는 Web에서 PAT를 먼저 만든 뒤 CLI가 안전하게 입력을 요청하도록 할 수 있습니다.
+
+```bash
+multica login --token
+```
+
+## API 요청에서 PAT 사용
+
+PAT를 `Authorization` header에 넣습니다.
+
+```bash
+export MULTICA_TOKEN='mul_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+
+curl https://api.multica.ai/api/me \
+  -H "Authorization: Bearer $MULTICA_TOKEN"
+```
+
+워크스페이스 수준 API를 호출할 때는 인터페이스 요구 사항에 따라 워크스페이스도 제공해야 합니다.
+
+```bash
+curl https://api.multica.ai/api/issues \
+  -H "Authorization: Bearer $MULTICA_TOKEN" \
+  -H "X-Workspace-ID: $MULTICA_WORKSPACE_ID"
+```
+
+스크립트의 토큰은 secret manager나 보호된 환경 변수에서 가져오고 하드코딩하지 마세요. 자체 호스팅 인스턴스에서는 도메인을 공개 API 주소로 바꿉니다.
+
+## 로그아웃과 취소
+
+`multica auth logout`은 현재 CLI profile에 저장된 PAT만 삭제합니다. Web 로그아웃은 현재 브라우저의 cookie만 삭제합니다. 어느 쪽도 서버의 개인 액세스 토큰을 취소하지 않습니다.
+
+토큰이 노출되었을 가능성이 있다면 **설정 → API Token**에서 즉시 취소하세요. 취소된 PAT는 다시 사용할 수 없으며 이 PAT를 저장한 다른 컴퓨터와 스크립트도 접근 권한을 잃습니다.
+
+## 에이전트 실행용 임시 토큰
+
+데몬이 실행을 가져가면 서버가 해당 실행을 위해 `mat_`로 시작하는 임시 토큰을 만듭니다. 현재 사용자, 워크스페이스, 에이전트, 실행에 연결되고 최대 24시간 동안 유효하며 실행이 끝나면 정리됩니다.
+
+데몬은 사용자 PAT 대신 이 임시 토큰을 AI 코딩 도구에 주입합니다. 따라서 에이전트가 보낸 요청은 에이전트의 동작으로 기록되며 사용자나 owner만 수행할 수 있는 민감한 작업을 이 토큰으로 호출할 수도 없습니다.
+
+이 토큰은 서버가 자동으로 만들며 사용자가 저장하거나 관리할 필요가 없습니다.
+
+## 기타 머신 자격 증명
+
+서버는 내부 또는 관리형 환경에서 사용하는 두 가지 자격 증명도 인식합니다.
+
+| 접두사 | 용도 | 관리 주체 |
+| --- | --- | --- |
+| `mcn_` | Multica Cloud Node 연결 | Multica Cloud Fleet |
+| `mdt_` | 워크스페이스 범위의 데몬 인증 프로토콜 | 서버 내부 절차 |
+
+일반 Cloud, 자체 호스팅, Desktop 설치에서는 이를 직접 만들 필요가 없습니다. 사용자 측 CLI와 데몬은 항상 `mul_` PAT를 사용합니다. 다른 접두사의 토큰을 직접 만들지 마세요.
+
+## 다음 단계
+
+- [CLI 사용](/cli) — `login`, `auth status`, profile 설정을 알아봅니다.
+- [데몬과 런타임](/daemon-runtimes) — PAT 갱신이 일어나는 위치를 알아봅니다.
+- [로그인과 가입](/auth-setup) — 세션 유효 기간과 가입 제한의 서버 설정을 알아봅니다.

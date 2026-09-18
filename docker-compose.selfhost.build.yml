@@ -1,0 +1,21 @@
+# Development override: build the backend/web images from the current checkout
+# instead of pulling the official GHCR images.
+
+services:
+  backend:
+    image: multica-backend:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        DATE: ${DATE:-unknown}
+
+  frontend:
+    image: multica-web:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_APP_VERSION: dev

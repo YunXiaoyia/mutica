@@ -1,0 +1,4859 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// ── extractACPSessionID ──
+
+func TestExtractACPSessionID(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"sessionId":"20260410_141145_47260c"}`)
+	got := extractACPSessionID(raw)
+	if got != "20260410_141145_47260c" {
+		t.Errorf("got %q, want %q", got, "20260410_141145_47260c")
+	}
+}
+
+func TestExtractACPSessionIDEmpty(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{}`)
+	got := extractACPSessionID(raw)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+func TestExtractACPSessionIDInvalidJSON(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`not json`)
+	got := extractACPSessionID(raw)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// ── extractACPCurrentModelID ──
+
+func TestExtractACPCurrentModelID(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{
+		"sessionId": "ses_123",
+		"models": {
+			"currentModelId": "nous:moonshotai/kimi-k2.6"
+		}
+	}`)
+	got := extractACPCurrentModelID(raw)
+	if got != "nous:moonshotai/kimi-k2.6" {
+		t.Errorf("got %q, want current model", got)
+	}
+}
+
+func TestExtractACPCurrentModelIDSnakeCase(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{
+		"session_id": "ses_123",
+		"models": {
+			"current_model_id": "openrouter:anthropic/claude-sonnet-4.6"
+		}
+	}`)
+	got := extractACPCurrentModelID(raw)
+	if got != "openrouter:anthropic/claude-sonnet-4.6" {
+		t.Errorf("got %q, want current model", got)
+	}
+}
+
+func TestExtractACPCurrentModelIDMissing(t *testing.T) {
+	t.Parallel()
+	if got := extractACPCurrentModelID(json.RawMessage(`{"sessionId":"ses_123"}`)); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// ── acpModelIDsEquivalent ──
+
+func TestACPModelIDsEquivalent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		configured string
+		current    string
+		want       bool
+	}{
+		{
+			// The regression this helper exists for: agent.model is stored
+			// bare, Hermes reports the provider-encoded form. A raw string
+			// compare missed, so the MUL-5029 skip-gate never fired and every
+			// turn re-sent set_model — rebuilding the runtime-side agent and
+			// re-running the provider auto-detection the gate exists to avoid.
+			name:       "bare configured vs provider-encoded current",
+			configured: "claude-sonnet-4-5",
+			current:    "custom:claude-sonnet-4-5",
+			want:       true,
+		},
+		{
+			name:       "both provider-encoded and identical",
+			configured: "custom:claude-sonnet-4-5",
+			current:    "custom:claude-sonnet-4-5",
+			want:       true,
+		},
+		{
+			name:       "second bare model vs encoded",
+			configured: "claude-haiku-4-5",
+			current:    "custom:claude-haiku-4-5",
+			want:       true,
+		},
+		{
+			// A real provider switch must still send set_model.
+			name:       "same model, different explicit providers",
+			configured: "openrouter:claude-sonnet-4-5",
+			current:    "custom:claude-sonnet-4-5",
+			want:       false,
+		},
+		{
+			name:       "different models under same provider",
+			configured: "custom:claude-sonnet-4-5",
+			current:    "custom:claude-haiku-4-5",
+			want:       false,
+		},
+		{
+			name:       "different bare models",
+			configured: "claude-sonnet-4-5",
+			current:    "custom:claude-opus-4-5",
+			want:       false,
+		},
+		{
+			// Hermes lowercases the provider when encoding; a config written
+			// with different casing must still match.
+			name:       "provider casing differs",
+			configured: "Custom:Claude-Sonnet-4-5",
+			current:    "custom:claude-sonnet-4-5",
+			want:       true,
+		},
+		{
+			// Older runtime / unparsable state: fall through and send
+			// set_model, preserving prior behaviour.
+			name:       "empty current",
+			configured: "claude-sonnet-4-5",
+			current:    "",
+			want:       false,
+		},
+		{
+			name:       "empty configured",
+			configured: "",
+			current:    "custom:claude-sonnet-4-5",
+			want:       false,
+		},
+		{
+			name:       "both empty",
+			configured: "",
+			current:    "",
+			want:       false,
+		},
+		{
+			name:       "surrounding whitespace is ignored",
+			configured: "  claude-sonnet-4-5 ",
+			current:    "custom:claude-sonnet-4-5",
+			want:       true,
+		},
+		{
+			// Model names carrying a slash (OpenRouter-style) must not be
+			// confused with the provider prefix.
+			name:       "slash-bearing model name, bare vs encoded",
+			configured: "moonshotai/kimi-k2.6",
+			current:    "nous:moonshotai/kimi-k2.6",
+			want:       true,
+		},
+		{
+			// The asymmetric case. A bare *configured* id expresses no
+			// provider preference, but an explicit one does, and a bare
+			// *current* id cannot confirm it was honoured. Treating this as
+			// equivalent would silently swallow the switch the member asked
+			// for, so it must fall through and send set_model.
+			//
+			// Bare current ids are not hypothetical: acp_effort_test.go
+			// captures an unprefixed `gpt-5.6-sol` from jcode, which routes
+			// through this same backend. Hermes Agent's encoder has a bare
+			// branch too, though a normally-configured install resolves a
+			// provider and reports the prefixed form.
+			name:       "explicit configured provider vs bare current",
+			configured: "openrouter:hermes-4",
+			current:    "hermes-4",
+			want:       false,
+		},
+		{
+			// Both sides bare and identical: nothing to switch to, and the
+			// runtimes above really do answer this way.
+			name:       "both bare and identical",
+			configured: "hermes-4",
+			current:    "hermes-4",
+			want:       true,
+		},
+		{
+			name:       "both bare, different models",
+			configured: "hermes-4",
+			current:    "gpt-5.6-sol",
+			want:       false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := acpModelIDsEquivalent(tc.configured, tc.current); got != tc.want {
+				t.Errorf("acpModelIDsEquivalent(%q, %q) = %v, want %v",
+					tc.configured, tc.current, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSplitACPModelID(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in           string
+		wantProvider string
+		wantModel    string
+	}{
+		{"custom:claude-sonnet-4-5", "custom", "claude-sonnet-4-5"},
+		{"claude-sonnet-4-5", "", "claude-sonnet-4-5"},
+		{"nous:moonshotai/kimi-k2.6", "nous", "moonshotai/kimi-k2.6"},
+		{"", "", ""},
+		// Leading colon carries no provider — index 0 is not a separator.
+		{":weird", "", ":weird"},
+		// Only the first colon separates; the rest belongs to the model.
+		{"custom:vendor:model", "custom", "vendor:model"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			gotProvider, gotModel := splitACPModelID(tc.in)
+			if gotProvider != tc.wantProvider || gotModel != tc.wantModel {
+				t.Errorf("splitACPModelID(%q) = (%q, %q), want (%q, %q)",
+					tc.in, gotProvider, gotModel, tc.wantProvider, tc.wantModel)
+			}
+		})
+	}
+}
+
+// ── resolveResumedSessionID ──
+
+func TestResolveResumedSessionIDMatching(t *testing.T) {
+	t.Parallel()
+	// Server confirms our requested id — happy resume path. No change.
+	got, changed := resolveResumedSessionID(
+		"ses_alpha",
+		json.RawMessage(`{"sessionId":"ses_alpha"}`),
+	)
+	if got != "ses_alpha" {
+		t.Errorf("got %q, want ses_alpha", got)
+	}
+	if changed {
+		t.Errorf("changed: got true, want false")
+	}
+}
+
+func TestResolveResumedSessionIDDifferent(t *testing.T) {
+	t.Parallel()
+	// Server returned a different id — local state was lost and the
+	// server silently spun up a new session. We trust the server.
+	got, changed := resolveResumedSessionID(
+		"ses_alpha",
+		json.RawMessage(`{"sessionId":"ses_beta_new"}`),
+	)
+	if got != "ses_beta_new" {
+		t.Errorf("got %q, want ses_beta_new", got)
+	}
+	if !changed {
+		t.Errorf("changed: got false, want true")
+	}
+}
+
+func TestResolveResumedSessionIDEmptyResponse(t *testing.T) {
+	t.Parallel()
+	// Older / non-conforming server returns no sessionId — defensive
+	// fallback to the requested id. This preserves the legacy happy
+	// path; a stale id will eventually fail downstream and be retried
+	// via the daemon's session-resume fallback (daemon.go).
+	for _, body := range []string{
+		`{}`,
+		`{"sessionId":""}`,
+		`not json`,
+	} {
+		got, changed := resolveResumedSessionID(
+			"ses_alpha",
+			json.RawMessage(body),
+		)
+		if got != "ses_alpha" {
+			t.Errorf("body=%q: got %q, want ses_alpha", body, got)
+		}
+		if changed {
+			t.Errorf("body=%q: changed: got true, want false", body)
+		}
+	}
+}
+
+// ── buildHermesSessionParams ──
+
+func TestBuildHermesSessionParamsIncludesModel(t *testing.T) {
+	t.Parallel()
+	params := buildHermesSessionParams("/tmp/work", "gpt-4o", nil)
+	if params["cwd"] != "/tmp/work" {
+		t.Errorf("cwd: got %v, want /tmp/work", params["cwd"])
+	}
+	if _, ok := params["mcpServers"]; !ok {
+		t.Error("mcpServers missing")
+	}
+	if got, ok := params["model"].(string); !ok || got != "gpt-4o" {
+		t.Errorf("model: got %v, want gpt-4o", params["model"])
+	}
+}
+
+func TestBuildHermesSessionParamsOmitsEmptyModel(t *testing.T) {
+	t.Parallel()
+	params := buildHermesSessionParams("/tmp/work", "", nil)
+	if _, present := params["model"]; present {
+		t.Error("expected model key to be omitted when model is empty")
+	}
+}
+
+func TestBuildHermesSessionParamsPassesThroughMcpServers(t *testing.T) {
+	t.Parallel()
+	servers := []any{map[string]any{"name": "fetch", "command": "uvx", "args": []string{}, "env": []map[string]any{}}}
+	params := buildHermesSessionParams("/tmp/work", "", servers)
+	got, ok := params["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("mcpServers: got %T, want []any", params["mcpServers"])
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(mcpServers): got %d, want 1", len(got))
+	}
+}
+
+func TestBuildHermesSessionParamsNilMcpServersBecomesEmptyArray(t *testing.T) {
+	t.Parallel()
+	// ACP requires the field; nil must surface as `[]` so the wire request
+	// stays well-formed even when no MCP servers are configured.
+	params := buildHermesSessionParams("/tmp/work", "", nil)
+	got, ok := params["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("mcpServers: got %T, want []any", params["mcpServers"])
+	}
+	if len(got) != 0 {
+		t.Errorf("len(mcpServers): got %d, want 0", len(got))
+	}
+}
+
+// ── buildACPMcpServers ──
+
+func TestBuildACPMcpServersEmptyInputReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []json.RawMessage{nil, {}, json.RawMessage("null"), json.RawMessage(" null "), json.RawMessage("{}"), json.RawMessage(`{"mcpServers":{}}`)} {
+		got, err := buildACPMcpServers(raw, slog.Default())
+		if err != nil {
+			t.Fatalf("raw=%q: unexpected error: %v", string(raw), err)
+		}
+		if got == nil {
+			t.Errorf("raw=%q: got nil, want non-nil empty slice", string(raw))
+		}
+		if len(got) != 0 {
+			t.Errorf("raw=%q: got %d entries, want 0", string(raw), len(got))
+		}
+	}
+}
+
+func TestBuildACPMcpServersTranslatesStdioEntry(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx","args":["mcp-server-fetch"],"env":{"API_KEY":"secret","HOME":"/tmp"}}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+	entry, ok := got[0].(map[string]any)
+	if !ok {
+		t.Fatalf("entry type: got %T, want map[string]any", got[0])
+	}
+	if entry["name"] != "fetch" {
+		t.Errorf("name: got %v, want fetch", entry["name"])
+	}
+	if entry["command"] != "uvx" {
+		t.Errorf("command: got %v, want uvx", entry["command"])
+	}
+	if _, hasType := entry["type"]; hasType {
+		t.Errorf("stdio entry should not include type field, got %v", entry["type"])
+	}
+	args, ok := entry["args"].([]string)
+	if !ok || len(args) != 1 || args[0] != "mcp-server-fetch" {
+		t.Errorf("args: got %v, want [mcp-server-fetch]", entry["args"])
+	}
+	envArr, ok := entry["env"].([]map[string]any)
+	if !ok {
+		t.Fatalf("env type: got %T, want []map[string]any", entry["env"])
+	}
+	// Env entries sorted by key for determinism.
+	if len(envArr) != 2 {
+		t.Fatalf("len(env): got %d, want 2", len(envArr))
+	}
+	if envArr[0]["name"] != "API_KEY" || envArr[0]["value"] != "secret" {
+		t.Errorf("env[0]: got %v, want {name:API_KEY,value:secret}", envArr[0])
+	}
+	if envArr[1]["name"] != "HOME" || envArr[1]["value"] != "/tmp" {
+		t.Errorf("env[1]: got %v, want {name:HOME,value:/tmp}", envArr[1])
+	}
+}
+
+func TestBuildACPMcpServersStdioWithoutArgsOrEnvUsesEmptyArrays(t *testing.T) {
+	t.Parallel()
+	// ACP requires args and env to be arrays; missing fields must become
+	// `[]` rather than null so the wire shape passes server-side validation.
+	raw := json.RawMessage(`{"mcpServers":{"minimal":{"command":"echo"}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	entry := got[0].(map[string]any)
+	if args, ok := entry["args"].([]string); !ok || len(args) != 0 {
+		t.Errorf("args: got %v, want []", entry["args"])
+	}
+	if env, ok := entry["env"].([]map[string]any); !ok || len(env) != 0 {
+		t.Errorf("env: got %v, want []", entry["env"])
+	}
+}
+
+func TestBuildACPMcpServersTranslatesHttpEntry(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"mcpServers":{"remote":{"type":"http","url":"https://example.com/mcp","headers":{"Authorization":"Bearer x","X-Trace":"abc"}}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+	entry := got[0].(map[string]any)
+	if entry["type"] != "http" {
+		t.Errorf("type: got %v, want http", entry["type"])
+	}
+	if entry["name"] != "remote" {
+		t.Errorf("name: got %v, want remote", entry["name"])
+	}
+	if entry["url"] != "https://example.com/mcp" {
+		t.Errorf("url: got %v, want https://example.com/mcp", entry["url"])
+	}
+	headers, ok := entry["headers"].([]map[string]any)
+	if !ok || len(headers) != 2 {
+		t.Fatalf("headers: got %v, want 2 entries", entry["headers"])
+	}
+	if headers[0]["name"] != "Authorization" {
+		t.Errorf("headers[0].name: got %v, want Authorization", headers[0]["name"])
+	}
+}
+
+func TestBuildACPMcpServersDefaultsRemoteTypeToHttp(t *testing.T) {
+	t.Parallel()
+	// A `url` without `type` should default to "http" rather than be classified
+	// as stdio or get dropped.
+	raw := json.RawMessage(`{"mcpServers":{"remote":{"url":"https://example.com/mcp"}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	entry := got[0].(map[string]any)
+	if entry["type"] != "http" {
+		t.Errorf("type: got %v, want http (default)", entry["type"])
+	}
+}
+
+func TestBuildACPMcpServersSupportsSseTransport(t *testing.T) {
+	t.Parallel()
+	raw := json.RawMessage(`{"mcpServers":{"remote":{"type":"sse","url":"https://example.com/sse"}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	entry := got[0].(map[string]any)
+	if entry["type"] != "sse" {
+		t.Errorf("type: got %v, want sse", entry["type"])
+	}
+}
+
+func TestBuildACPMcpServersAcceptsStreamableHttpAlias(t *testing.T) {
+	t.Parallel()
+	// Claude's MCP CLI uses "streamable-http" / "http_streamable" as
+	// aliases for the http transport; ACP only knows "http", so the
+	// translator must collapse the alias.
+	for _, alias := range []string{"streamable-http", "http_streamable", "Streamable-HTTP"} {
+		raw := json.RawMessage(`{"mcpServers":{"remote":{"type":"` + alias + `","url":"https://example.com/mcp"}}}`)
+		got, err := buildACPMcpServers(raw, slog.Default())
+		if err != nil {
+			t.Fatalf("alias=%s: unexpected error: %v", alias, err)
+		}
+		entry := got[0].(map[string]any)
+		if entry["type"] != "http" {
+			t.Errorf("alias=%s: type got %v, want http", alias, entry["type"])
+		}
+	}
+}
+
+func TestBuildACPMcpServersSortsEntriesByName(t *testing.T) {
+	t.Parallel()
+	// Map iteration is randomized in Go; the translator sorts by name so
+	// the wire request and test assertions are deterministic.
+	raw := json.RawMessage(`{"mcpServers":{"zeta":{"command":"z"},"alpha":{"command":"a"},"mid":{"command":"m"}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"alpha", "mid", "zeta"}
+	for i, w := range want {
+		if got[i].(map[string]any)["name"] != w {
+			t.Errorf("position %d: got %v, want %s", i, got[i].(map[string]any)["name"], w)
+		}
+	}
+}
+
+func TestBuildACPMcpServersSkipsInvalidEntriesAndContinues(t *testing.T) {
+	t.Parallel()
+	// An entry with neither command nor url is invalid — drop it with a
+	// warning rather than failing the whole launch, so a single bad entry
+	// in the agent UI doesn't take MCP down for the rest of the agent.
+	raw := json.RawMessage(`{"mcpServers":{"bad":{"args":["nothing"]},"good":{"command":"uvx"}}}`)
+	got, err := buildACPMcpServers(raw, slog.Default())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1 (bad entry should be skipped)", len(got))
+	}
+	if got[0].(map[string]any)["name"] != "good" {
+		t.Errorf("kept the wrong entry: %v", got[0])
+	}
+}
+
+func TestBuildACPMcpServersReturnsErrorOnMalformedJSON(t *testing.T) {
+	t.Parallel()
+	_, err := buildACPMcpServers(json.RawMessage(`not json`), slog.Default())
+	if err == nil {
+		t.Fatal("expected error for malformed JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "parse mcp_config json") {
+		t.Errorf("error message: got %q, want it to mention parsing", err.Error())
+	}
+}
+
+// ── non-canonical mcp_config top-level keys ──
+
+// buildACPMcpServersLogs runs the translation with a capturing logger and
+// returns everything written, so the tests below can assert on the operator
+// signal rather than only on the (still empty) server list.
+func buildACPMcpServersLogs(t *testing.T, raw string) (string, []any) {
+	t.Helper()
+	var logs bytes.Buffer
+	got, err := buildACPMcpServers(json.RawMessage(raw), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("buildACPMcpServers(%s) error: %v", raw, err)
+	}
+	return logs.String(), got
+}
+
+// A runtime-native config pasted into mcp_config used to produce an empty
+// server list and no log line at all — the agent just ran with no MCP tools
+// (#6540). It still produces no servers, but it must no longer be silent.
+func TestBuildACPMcpServersWarnsOnRuntimeNativeTopLevelKey(t *testing.T) {
+	t.Parallel()
+	// The exact shape from the #6540 reporter's jcode mcp.json.
+	raw := `{"servers":{"codebase-memory":{"command":"/usr/local/bin/codebase-memory-mcp","args":[],"shared":true}}}`
+	logs, got := buildACPMcpServersLogs(t, raw)
+	if len(got) != 0 {
+		t.Fatalf("servers: got %d, want 0 (entries are not adopted, only reported)", len(got))
+	}
+	if !strings.Contains(logs, "mcpServers") {
+		t.Errorf("warning should name the canonical key; got %q", logs)
+	}
+	if !strings.Contains(logs, `"found_key":"servers"`) {
+		t.Errorf("warning should name the key actually found; got %q", logs)
+	}
+}
+
+func TestBuildACPMcpServersWarnsOnOtherRuntimeNativeKeys(t *testing.T) {
+	t.Parallel()
+	for _, key := range []string{"mcp", "mcp_servers"} {
+		raw := fmt.Sprintf(`{%q:{"fetch":{"command":"uvx"}}}`, key)
+		logs, got := buildACPMcpServersLogs(t, raw)
+		if len(got) != 0 {
+			t.Errorf("%s: servers got %d, want 0", key, len(got))
+		}
+		if !strings.Contains(logs, fmt.Sprintf(`"found_key":%q`, key)) {
+			t.Errorf("%s: warning should name the key found; got %q", key, logs)
+		}
+	}
+}
+
+// A deliberately empty managed config is a valid state (it means "this agent
+// has no MCP servers"), so it must not be reported as a misconfiguration.
+func TestBuildACPMcpServersDoesNotWarnOnCanonicalOrEmptyConfig(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{`{"mcpServers":{}}`, `{}`, `null`, `{"servers":{}}`} {
+		logs, got := buildACPMcpServersLogs(t, raw)
+		if len(got) != 0 {
+			t.Errorf("%s: servers got %d, want 0", raw, len(got))
+		}
+		if strings.Contains(logs, "found_key") {
+			t.Errorf("%s: should not warn, got %q", raw, logs)
+		}
+	}
+}
+
+// ── hermesToolNameFromTitle ──
+
+func TestHermesToolNameFromTitle(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		title string
+		kind  string
+		want  string
+	}{
+		{"terminal: ls -la", "execute", "terminal"},
+		{"read: /tmp/foo.go", "read", "read_file"},
+		{"write: /tmp/bar.go", "edit", "write_file"},
+		{"patch (replace): /tmp/baz.go", "edit", "patch"},
+		{"search: *.go", "search", "search_files"},
+		{"web search: golang acp protocol", "fetch", "web_search"},
+		{"extract: https://example.com", "fetch", "web_extract"},
+		{"delegate: fix the bug", "execute", "delegate_task"},
+		{"analyze image: what is this?", "read", "vision_analyze"},
+		{"execute code", "execute", "execute_code"},
+		// Fallback to kind when no colon in title but kind is known.
+		{"unknownTool", "read", "read_file"},
+		{"unknownTool", "edit", "write_file"},
+		{"unknownTool", "execute", "terminal"},
+		{"unknownTool", "search", "search_files"},
+		{"unknownTool", "fetch", "web_search"},
+		{"unknownTool", "think", "thinking"},
+		// Bare title (no colon, no known kind) — preserve the title
+		// itself rather than falling back to an unclassified kind.
+		// Matters for kimi: its ACP `tool_call` updates emit a bare
+		// `title: "Shell"` with no `kind`, and we need downstream
+		// normalisation (kimiToolNameFromTitle) to see "Shell" rather
+		// than an empty string.
+		{"Shell", "", "Shell"},
+		{"Read file", "", "Read file"},
+		{"unknownTool", "other", "unknownTool"},
+		// Empty title falls back to kind, even when kind isn't known.
+		{"", "other", "other"},
+		// Tool with colon but not in known map.
+		{"custom_tool: args", "other", "custom_tool"},
+	}
+	for _, tt := range tests {
+		got := hermesToolNameFromTitle(tt.title, tt.kind)
+		if got != tt.want {
+			t.Errorf("hermesToolNameFromTitle(%q, %q) = %q, want %q", tt.title, tt.kind, got, tt.want)
+		}
+	}
+}
+
+// ── handleLine routing ──
+
+func TestHermesClientHandleLineResponse(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+	pr := &pendingRPC{ch: make(chan rpcResult, 1), method: "session/new"}
+	c.pending[1] = pr
+
+	c.handleLine(`{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_abc"}}`)
+
+	res := <-pr.ch
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	sid := extractACPSessionID(res.result)
+	if sid != "ses_abc" {
+		t.Errorf("sessionId: got %q, want %q", sid, "ses_abc")
+	}
+}
+
+func TestHermesClientHandleLineError(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+	pr := &pendingRPC{ch: make(chan rpcResult, 1), method: "initialize"}
+	c.pending[0] = pr
+
+	c.handleLine(`{"jsonrpc":"2.0","id":0,"error":{"code":-32600,"message":"bad request"}}`)
+
+	res := <-pr.ch
+	if res.err == nil {
+		t.Fatal("expected error")
+	}
+	if got := res.err.Error(); got != "initialize: bad request (code=-32600)" {
+		t.Errorf("error: got %q", got)
+	}
+}
+
+// TestHermesClientHandleLineErrorWithData guards #2192-class regressions: when
+// an ACP backend returns -32603 (Internal error), the meaningful reason lives
+// in the `data` field. Dropping it leaves operators with a bare "Internal
+// error" and no way to tell apart "session expired", "model unavailable",
+// "auth lost", etc. Kiro CLI 2.2.x emits `data` as a string; some backends use
+// objects/arrays — both must round-trip into the wrapped Go error.
+func TestHermesClientHandleLineErrorWithStringData(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+	pr := &pendingRPC{ch: make(chan rpcResult, 1), method: "session/prompt"}
+	c.pending[3] = pr
+
+	c.handleLine(`{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Internal error","data":"No session found with id"}}`)
+
+	res := <-pr.ch
+	if res.err == nil {
+		t.Fatal("expected error")
+	}
+	want := "session/prompt: Internal error (code=-32603, data=No session found with id)"
+	if got := res.err.Error(); got != want {
+		t.Errorf("error: got %q, want %q", got, want)
+	}
+}
+
+func TestHermesClientHandleLineErrorWithObjectData(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+	pr := &pendingRPC{ch: make(chan rpcResult, 1), method: "session/prompt"}
+	c.pending[5] = pr
+
+	c.handleLine(`{"jsonrpc":"2.0","id":5,"error":{"code":-32000,"message":"quota","data":{"reason":"limit","remaining":0}}}`)
+
+	res := <-pr.ch
+	if res.err == nil {
+		t.Fatal("expected error")
+	}
+	want := `session/prompt: quota (code=-32000, data={"reason":"limit","remaining":0})`
+	if got := res.err.Error(); got != want {
+		t.Errorf("error: got %q, want %q", got, want)
+	}
+}
+
+func TestHermesClientHandleLineErrorWithNullData(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+	pr := &pendingRPC{ch: make(chan rpcResult, 1), method: "initialize"}
+	c.pending[7] = pr
+
+	c.handleLine(`{"jsonrpc":"2.0","id":7,"error":{"code":-32600,"message":"bad request","data":null}}`)
+
+	res := <-pr.ch
+	if res.err == nil {
+		t.Fatal("expected error")
+	}
+	if got := res.err.Error(); got != "initialize: bad request (code=-32600)" {
+		t.Errorf("error: got %q", got)
+	}
+}
+
+// ── agent → client request handling ──
+
+// bufferWriter is a test stand-in for cmd.StdinPipe that captures
+// writes in-memory so we can assert what handleAgentRequest emitted.
+type bufferWriter struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *bufferWriter) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.WriteString(string(p))
+}
+
+func (b *bufferWriter) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestHermesClientAutoApprovesPermissionRequest asserts how the client
+// answers an ACP agent's `session/request_permission`. It must select an
+// optionId the agent *actually offered* — an id the agent never offered is
+// treated as a denial and, on Hermes' edit path, silently blocks every file
+// write (GitHub multica#5300). It prefers a session-scoped grant over a
+// single-use one, refuses to auto-select a permanent "allow_always" (which
+// persists to the runtime owner's on-disk allowlist), denies a single action
+// by selecting an offered reject_once rather than replying "cancelled" (which
+// other ACP backends read as cancelling the whole turn), and returns a
+// protocol error when nothing is safely selectable. The reply always echoes
+// the agent's request id.
+func TestHermesClientAutoApprovesPermissionRequest(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		options string
+		wantErr bool   // true → JSON-RPC error reply, no outcome
+		wantID  string // expected selected optionId when wantErr == false
+	}{
+		{
+			// Hermes edit-approval offers only these two and requires
+			// exactly "allow_once"; this is the multica#5300 regression
+			// the old hardcoded "approve_for_session" reply broke.
+			name:    "hermes edit approval selects allow_once",
+			options: `[{"optionId":"allow_once","name":"Allow edit","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]`,
+			wantID:  "allow_once",
+		},
+		{
+			// Hermes command approval offers a session option; prefer it over
+			// both the permanent "allow_always" and single-use "allow_once".
+			name:    "command approval prefers session over permanent",
+			options: `[{"optionId":"allow_once","kind":"allow_once"},{"optionId":"allow_session","kind":"allow_always"},{"optionId":"allow_always","kind":"allow_always"},{"optionId":"deny","kind":"reject_once"},{"optionId":"deny_always","kind":"reject_always"}]`,
+			wantID:  "allow_session",
+		},
+		{
+			// Other ACP agents' session-scoped id is honoured when offered.
+			name:    "session-scoped id honoured",
+			options: `[{"optionId":"approve","kind":"allow_once"},{"optionId":"approve_for_session","kind":"allow_always"},{"optionId":"reject","kind":"reject_once"}]`,
+			wantID:  "approve_for_session",
+		},
+		{
+			// Grant nature comes from the ACP kind, not the opaque optionId:
+			// a single-use option with a non-standard id is still selected.
+			name:    "non-standard single-use id selected by kind",
+			options: `[{"optionId":"yolo-42","kind":"allow_once"},{"optionId":"nope","kind":"reject_once"}]`,
+			wantID:  "yolo-42",
+		},
+		{
+			// Only a permanent grant offered: never auto-persist it; deny this
+			// action by selecting the offered single-use reject instead.
+			name:    "permanent grant refused, offered reject_once selected",
+			options: `[{"optionId":"allow_always","kind":"allow_always"},{"optionId":"deny","kind":"reject_once"}]`,
+			wantID:  "deny",
+		},
+		{
+			// No grant at all: deny this action via the offered reject_once.
+			name:    "reject-only selects reject_once",
+			options: `[{"optionId":"deny","kind":"reject_once"},{"optionId":"deny_always","kind":"reject_always"}]`,
+			wantID:  "deny",
+		},
+		{
+			// Unknown / future kind is not a grant; fall through to reject_once.
+			name:    "unknown kind selects offered reject_once",
+			options: `[{"optionId":"allow_forever","kind":"allow_super"},{"optionId":"deny","kind":"reject_once"}]`,
+			wantID:  "deny",
+		},
+		{
+			// Permanent grant with no single-use reject: nothing safely
+			// selectable → protocol error, not a fabricated outcome.
+			name:    "permanent-only without reject_once errors",
+			options: `[{"optionId":"allow_always","kind":"allow_always"}]`,
+			wantErr: true,
+		},
+		{
+			// Only a permanent reject offered: we don't auto-persist a denial
+			// either → protocol error.
+			name:    "reject_always-only errors",
+			options: `[{"optionId":"deny_always","kind":"reject_always"}]`,
+			wantErr: true,
+		},
+		{
+			// No options at all: protocol error rather than fabricate a reply.
+			name:    "empty options errors",
+			options: `[]`,
+			wantErr: true,
+		},
+		{
+			// Malformed options payload (not an array): protocol error.
+			name:    "malformed options errors",
+			options: `"not-an-array"`,
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			w := &bufferWriter{}
+			c := &hermesClient{
+				cfg:     Config{Logger: slog.Default()},
+				stdin:   w,
+				pending: make(map[int]*pendingRPC),
+			}
+
+			c.handleLine(`{"jsonrpc":"2.0","id":42,"method":"session/request_permission","params":{"sessionId":"ses_1","options":` + tc.options + `,"toolCall":{"toolCallId":"tc_1","title":"write: reply.md","content":[]}}}`)
+
+			got := w.String()
+			var resp struct {
+				JSONRPC string `json:"jsonrpc"`
+				ID      int    `json:"id"`
+				Result  *struct {
+					Outcome struct {
+						Outcome  string `json:"outcome"`
+						OptionID string `json:"optionId"`
+					} `json:"outcome"`
+				} `json:"result"`
+				Error *struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimSpace(got)), &resp); err != nil {
+				t.Fatalf("reply is not valid JSON: %q err=%v", got, err)
+			}
+			if resp.JSONRPC != "2.0" {
+				t.Errorf("jsonrpc: got %q, want 2.0", resp.JSONRPC)
+			}
+			if resp.ID != 42 {
+				t.Errorf("id: got %d, want 42 (must echo agent's request id)", resp.ID)
+			}
+			if tc.wantErr {
+				if resp.Error == nil {
+					t.Errorf("want a JSON-RPC error reply, got result %+v", resp.Result)
+				}
+				if resp.Result != nil {
+					t.Errorf("error reply must not carry a result, got %+v", resp.Result)
+				}
+				return
+			}
+			if resp.Error != nil {
+				t.Fatalf("unexpected JSON-RPC error reply: %+v", resp.Error)
+			}
+			if resp.Result == nil {
+				t.Fatalf("want a selected outcome, got no result: %q", got)
+			}
+			if resp.Result.Outcome.Outcome != "selected" {
+				t.Errorf("outcome.outcome: got %q, want %q", resp.Result.Outcome.Outcome, "selected")
+			}
+			if resp.Result.Outcome.OptionID != tc.wantID {
+				t.Errorf("outcome.optionId: got %q, want %q", resp.Result.Outcome.OptionID, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestHermesClientReplesMethodNotFoundForUnknownAgentRequest ensures
+// that any agent → client request we don't explicitly handle gets a
+// proper JSON-RPC error back, not silence. Silence would block the
+// agent for however long its internal timeout is, same as the
+// session/request_permission hang this change fixes.
+func TestHermesClientReplesMethodNotFoundForUnknownAgentRequest(t *testing.T) {
+	t.Parallel()
+
+	w := &bufferWriter{}
+	c := &hermesClient{
+		cfg:     Config{Logger: slog.Default()},
+		stdin:   w,
+		pending: make(map[int]*pendingRPC),
+	}
+	c.handleLine(`{"jsonrpc":"2.0","id":7,"method":"fs/read_text_file","params":{"path":"/tmp/x"}}`)
+
+	got := w.String()
+	var resp struct {
+		ID    int `json:"id"`
+		Error struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(got)), &resp); err != nil {
+		t.Fatalf("reply not valid JSON: %q err=%v", got, err)
+	}
+	if resp.ID != 7 {
+		t.Errorf("id echo: got %d, want 7", resp.ID)
+	}
+	if resp.Error.Code != -32601 {
+		t.Errorf("error code: got %d, want -32601 (method not found)", resp.Error.Code)
+	}
+	if !strings.Contains(resp.Error.Message, "fs/read_text_file") {
+		t.Errorf("error message should name the unhandled method, got %q", resp.Error.Message)
+	}
+}
+
+// ── session/update notification handling ──
+
+func TestHermesClientHandleAgentMessage(t *testing.T) {
+	t.Parallel()
+
+	var got Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = msg
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello world"}}}}`
+	c.handleLine(line)
+
+	if got.Type != MessageText {
+		t.Errorf("type: got %v, want MessageText", got.Type)
+	}
+	if got.Content != "Hello world" {
+		t.Errorf("content: got %q, want %q", got.Content, "Hello world")
+	}
+}
+
+func TestHermesClientHandleSessionNotificationAgentMessage(t *testing.T) {
+	t.Parallel()
+
+	var got Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = msg
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"ses_1","update":{"type":"AgentMessageChunk","content":{"type":"text","text":"Hello from Kiro"}}}}`
+	c.handleLine(line)
+
+	if got.Type != MessageText {
+		t.Errorf("type: got %v, want MessageText", got.Type)
+	}
+	if got.Content != "Hello from Kiro" {
+		t.Errorf("content: got %q, want %q", got.Content, "Hello from Kiro")
+	}
+}
+
+// Regression for #1997: Hermes ACP can flush queued session updates from
+// the previous turn (history replay on session/resume, or chunks queued
+// before our session/prompt response is sent) before the current turn
+// actually starts. Until acceptNotification gates them out, those updates
+// were appended to output and re-sent to the UI, making the previous
+// answer appear duplicated alongside the new one. The Backend wires the
+// gate to a streamingCurrentTurn flag set just before session/prompt; here
+// we exercise the gate directly on hermesClient.
+func TestHermesClientAcceptNotificationGate(t *testing.T) {
+	t.Parallel()
+
+	var (
+		got    []Message
+		accept bool
+	)
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		acceptNotification: func(string) bool {
+			return accept
+		},
+		onMessage: func(msg Message) {
+			got = append(got, msg)
+		},
+	}
+
+	replay := `{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"ses_1","update":{"type":"AgentMessageChunk","content":{"type":"text","text":"history should be ignored"}}}}`
+	c.handleLine(replay)
+	if len(got) != 0 {
+		t.Fatalf("expected gate to drop replay before turn starts, got %+v", got)
+	}
+
+	accept = true
+	live := `{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"ses_1","update":{"type":"AgentMessageChunk","content":{"type":"text","text":"current"}}}}`
+	c.handleLine(live)
+	if len(got) != 1 {
+		t.Fatalf("expected current-turn update to pass the gate, got %+v", got)
+	}
+	if got[0].Content != "current" {
+		t.Fatalf("got content %q, want \"current\"", got[0].Content)
+	}
+}
+
+// TestHermesBackendEmitsSessionStatusBeforeCompletion pins the producer side
+// of the daemon's mid-flight resume contract. Both a fresh session and a
+// resumed session must reveal the effective session ID before the prompt
+// finishes, otherwise a daemon restart can lose the only usable resume pointer.
+func TestHermesBackendEmitsSessionStatusBeforeCompletion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	tests := []struct {
+		name            string
+		resumeSessionID string
+		effectiveID     string
+	}{
+		{name: "fresh", effectiveID: "ses_new"},
+		{name: "resume uses returned id", resumeSessionID: "ses_old", effectiveID: "ses_resumed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			fakePath := filepath.Join(tempDir, "hermes")
+			gatePath := filepath.Join(tempDir, "release-prompt")
+			script := fmt.Sprintf(`#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*|*'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%%s,"result":{"sessionId":"%s"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      while [ ! -f "$HERMES_TEST_GATE" ]; do sleep 0.01; done
+      printf '{"jsonrpc":"2.0","id":%%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`, tt.effectiveID)
+			writeTestExecutable(t, fakePath, []byte(script))
+
+			backend, err := New("hermes", Config{
+				ExecutablePath: fakePath,
+				Logger:         slog.Default(),
+				Env:            map[string]string{"HERMES_TEST_GATE": gatePath},
+			})
+			if err != nil {
+				t.Fatalf("new hermes backend: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			session, err := backend.Execute(ctx, "prompt", ExecOptions{
+				ResumeSessionID: tt.resumeSessionID,
+				Timeout:         10 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+
+			select {
+			case msg, ok := <-session.Messages:
+				if !ok {
+					t.Fatal("message channel closed before session status")
+				}
+				if msg.Type != MessageStatus || msg.Status != "running" || msg.SessionID != tt.effectiveID {
+					t.Fatalf("session status = %+v, want running with session ID %q", msg, tt.effectiveID)
+				}
+			case result := <-session.Result:
+				t.Fatalf("terminal result arrived before session status: %+v", result)
+			case <-time.After(5 * time.Second):
+				t.Fatal("timeout waiting for mid-flight session status")
+			}
+
+			if err := os.WriteFile(gatePath, []byte("release"), 0o600); err != nil {
+				t.Fatalf("release prompt: %v", err)
+			}
+			select {
+			case result := <-session.Result:
+				if result.Status != "completed" || result.SessionID != tt.effectiveID {
+					t.Fatalf("result = %+v, want completed with session ID %q", result, tt.effectiveID)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("timeout waiting for terminal result")
+			}
+		})
+	}
+}
+
+func TestHermesBackendDrainsLateFinalNotificationAfterPromptResponse(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_resumed"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      sleep 0.05
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_resumed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Current answer"}}}}\n'
+      ;;
+  esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt", ExecOptions{
+		ResumeSessionID: "ses_resumed",
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+		if result.Output != "Current answer" {
+			t.Fatalf("expected late current-turn output, got %q", result.Output)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+func TestHermesBackendCancelsBeforeWaitingForLingeringProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_lingering"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exec 1>&-
+      exec 2>&-
+      while :; do :; done
+      ;;
+  esac
+done
+`
+	writeTestExecutable(t, fakePath, []byte(script))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "completed" {
+			t.Fatalf("expected completed, got status=%q error=%q", result.Status, result.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	select {
+	case _, ok := <-session.Result:
+		if ok {
+			t.Fatal("result channel produced an unexpected second value")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("result channel did not close; cmd.Wait likely ran before cancel")
+	}
+}
+
+func TestHermesClientHandleAgentThought(t *testing.T) {
+	t.Parallel()
+
+	var got Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = msg
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Let me think..."}}}}`
+	c.handleLine(line)
+
+	if got.Type != MessageThinking {
+		t.Errorf("type: got %v, want MessageThinking", got.Type)
+	}
+	if got.Content != "Let me think..." {
+		t.Errorf("content: got %q, want %q", got.Content, "Let me think...")
+	}
+}
+
+func TestHermesClientHandleToolCallStart(t *testing.T) {
+	t.Parallel()
+
+	var got Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = msg
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-abc123","title":"terminal: ls -la","kind":"execute","status":"pending","rawInput":{"command":"ls -la"}}}}`
+	c.handleLine(line)
+
+	if got.Type != MessageToolUse {
+		t.Errorf("type: got %v, want MessageToolUse", got.Type)
+	}
+	if got.Tool != "terminal" {
+		t.Errorf("tool: got %q, want %q", got.Tool, "terminal")
+	}
+	if got.CallID != "tc-abc123" {
+		t.Errorf("callID: got %q, want %q", got.CallID, "tc-abc123")
+	}
+	if cmd, ok := got.Input["command"].(string); !ok || cmd != "ls -la" {
+		t.Errorf("input.command: got %v", got.Input["command"])
+	}
+}
+
+func TestHermesClientHandleSessionNotificationToolCall(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = append(got, msg)
+		},
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"ses_1","update":{"type":"ToolCall","toolCallId":"tc-kiro","name":"Shell","status":"pending","parameters":{"command":"pwd"}}}}`)
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"ses_1","update":{"type":"ToolCallUpdate","toolCallId":"tc-kiro","status":"completed","name":"Shell","output":"/tmp/project\n"}}}`)
+
+	if len(got) != 2 {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if got[0].Type != MessageToolUse {
+		t.Errorf("first message: got %v, want MessageToolUse", got[0].Type)
+	}
+	if got[0].Tool != "Shell" {
+		t.Errorf("first tool: got %q, want Shell", got[0].Tool)
+	}
+	if cmd, _ := got[0].Input["command"].(string); cmd != "pwd" {
+		t.Errorf("first input.command: got %v, want pwd", got[0].Input["command"])
+	}
+	if got[1].Type != MessageToolResult {
+		t.Errorf("second message: got %v, want MessageToolResult", got[1].Type)
+	}
+	if got[1].Output != "/tmp/project\n" {
+		t.Errorf("second output: got %q", got[1].Output)
+	}
+	if got[1].Status != "completed" {
+		t.Errorf("second status: got %q, want completed", got[1].Status)
+	}
+}
+
+func TestHermesClientHandleSessionNotificationTurnEnd(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/notification","params":{"sessionId":"ses_1","update":{"type":"TurnEnd","stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":4,"cachedReadTokens":1}}}}`
+	c.handleLine(line)
+
+	if got.stopReason != "end_turn" {
+		t.Errorf("stopReason: got %q, want end_turn", got.stopReason)
+	}
+	if got.usage.InputTokens != 3 || got.usage.OutputTokens != 4 || got.usage.CacheReadTokens != 1 {
+		t.Errorf("usage: got %+v", got.usage)
+	}
+}
+
+func TestParseACPTokenUsageAliases(t *testing.T) {
+	t.Parallel()
+
+	usage := parseACPTokenUsage(json.RawMessage(`{
+		"input_tokens": 11,
+		"output_tokens": "7",
+		"cacheReadTokens": 5,
+		"cache_creation_input_tokens": 3
+	}`))
+
+	if usage.InputTokens != 11 {
+		t.Errorf("InputTokens: got %d, want 11", usage.InputTokens)
+	}
+	if usage.OutputTokens != 7 {
+		t.Errorf("OutputTokens: got %d, want 7", usage.OutputTokens)
+	}
+	if usage.CacheReadTokens != 5 {
+		t.Errorf("CacheReadTokens: got %d, want 5", usage.CacheReadTokens)
+	}
+	if usage.CacheWriteTokens != 3 {
+		t.Errorf("CacheWriteTokens: got %d, want 3", usage.CacheWriteTokens)
+	}
+}
+
+// TestParseACPTokenUsageCachedInputBucketing pins when cached reads are moved
+// out of inputTokens. Persisting overlapping buckets makes the dashboard
+// charge the cached prefix at both the full input rate and the cache-read
+// rate, so the re-bucketing must fire exactly when totalTokens proves the
+// counters overlap — and never otherwise.
+func TestParseACPTokenUsageCachedInputBucketing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want TokenUsage
+	}{
+		{
+			// Grok Build: totalTokens == input + output, so the cached prefix
+			// lives inside inputTokens.
+			name: "inclusive input is reduced by cached reads",
+			raw:  `{"inputTokens":12929,"outputTokens":29,"totalTokens":12958,"cachedReadTokens":10880}`,
+			want: TokenUsage{InputTokens: 2049, OutputTokens: 29, CacheReadTokens: 10880},
+		},
+		{
+			// totalTokens == input + cached + output: the buckets are already
+			// mutually exclusive.
+			name: "exclusive buckets are left alone",
+			raw:  `{"inputTokens":100,"outputTokens":20,"totalTokens":150,"cachedReadTokens":30}`,
+			want: TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 30},
+		},
+		{
+			// No totalTokens: nothing in the payload describes the overlap, so
+			// the counters are persisted as reported.
+			name: "missing totalTokens keeps counters as reported",
+			raw:  `{"inputTokens":100,"outputTokens":20,"cachedReadTokens":30}`,
+			want: TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 30},
+		},
+		{
+			// Cached reads larger than input cannot be a subset of it.
+			name: "cached larger than input keeps counters as reported",
+			raw:  `{"inputTokens":10,"outputTokens":20,"totalTokens":30,"cachedReadTokens":40}`,
+			want: TokenUsage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 40},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseACPTokenUsage(json.RawMessage(tt.raw)); got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHermesClientHandleToolCallComplete(t *testing.T) {
+	t.Parallel()
+
+	var got Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = msg
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-abc123","status":"completed","kind":"execute","rawOutput":"file1.go\nfile2.go\n"}}}`
+	c.handleLine(line)
+
+	if got.Type != MessageToolResult {
+		t.Errorf("type: got %v, want MessageToolResult", got.Type)
+	}
+	if got.CallID != "tc-abc123" {
+		t.Errorf("callID: got %q, want %q", got.CallID, "tc-abc123")
+	}
+	if got.Output != "file1.go\nfile2.go\n" {
+		t.Errorf("output: got %q", got.Output)
+	}
+}
+
+// TestHermesClientKimiStreamingToolCall walks the real kimi frame
+// sequence for a single Shell call:
+//  1. tool_call with empty content (LLM hasn't started emitting args yet)
+//  2. tool_call_update status=in_progress carrying the cumulative args
+//     JSON character-by-character ("{", "{\"command", …)
+//  3. tool_call_update status=completed carrying the command's stdout
+//
+// The client must defer MessageToolUse until we have the full args so
+// the UI doesn't show a command like `{"comma` — and the MessageToolUse
+// must carry the parsed args as the Input map (`{"command": "echo hi"}`
+// → Input["command"] = "echo hi") rather than a raw string.
+func TestHermesClientKimiStreamingToolCall(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = append(got, msg)
+		},
+	}
+
+	// 1. tool_call: empty content (classic kimi start frame).
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-kimi-1","title":"Shell","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":""}}]}}}`)
+	if len(got) != 0 {
+		t.Fatalf("expected nothing emitted yet (args empty), got %+v", got)
+	}
+
+	// 2. Streaming updates — cumulative args JSON.
+	partials := []string{
+		`{"`,
+		`{"command`,
+		`{"command":`,
+		`{"command":"echo `,
+		`{"command":"echo hi"}`,
+	}
+	for _, args := range partials {
+		// JSON-encode args so embedded quotes are escaped properly.
+		argsJSON, _ := json.Marshal(args)
+		line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-kimi-1","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":` + string(argsJSON) + `}}]}}}`
+		c.handleLine(line)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected nothing emitted mid-stream, got %+v", got)
+	}
+
+	// 3. Completed — stdout.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-kimi-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"hi\n"}}]}}}`)
+
+	if len(got) != 2 {
+		t.Fatalf("expected [MessageToolUse, MessageToolResult], got %d: %+v", len(got), got)
+	}
+	if got[0].Type != MessageToolUse {
+		t.Errorf("first message: got %v, want MessageToolUse", got[0].Type)
+	}
+	if got[0].CallID != "tc-kimi-1" {
+		t.Errorf("first.callID: got %q", got[0].CallID)
+	}
+	if cmd, _ := got[0].Input["command"].(string); cmd != "echo hi" {
+		t.Errorf("first.Input.command: got %v, want %q", got[0].Input["command"], "echo hi")
+	}
+	if got[1].Type != MessageToolResult {
+		t.Errorf("second message: got %v, want MessageToolResult", got[1].Type)
+	}
+	if got[1].Output != "hi\n" {
+		t.Errorf("second.output: got %q, want %q", got[1].Output, "hi\n")
+	}
+}
+
+// TestHermesClientKimiMalformedArgsFallback: if the accumulated args
+// aren't valid JSON (streaming glitch, tool with non-JSON args), we
+// still surface the text under Input.text rather than silently
+// dropping it.
+func TestHermesClientKimiMalformedArgsFallback(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = append(got, msg)
+		},
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc","title":"Shell","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"not-json"}}]}}}`)
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc","status":"completed","content":[{"type":"content","content":{"type":"text","text":"output"}}]}}}`)
+
+	if len(got) < 1 {
+		t.Fatalf("expected ToolUse+ToolResult, got %+v", got)
+	}
+	if text, _ := got[0].Input["text"].(string); text != "not-json" {
+		t.Errorf("fallback Input.text: got %v", got[0].Input["text"])
+	}
+}
+
+// TestHermesClientHandleToolCallCompleteOrphan: if a completion frame
+// arrives without a preceding tool_call (out-of-order / missed frame),
+// still emit ToolUse synthesised from the update's own title/rawInput
+// before ToolResult. Keeps the UI from showing a bare result with no
+// header.
+func TestHermesClientHandleToolCallCompleteOrphan(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = append(got, msg)
+		},
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc","status":"completed","title":"terminal: ls","kind":"execute","rawInput":{"command":"ls"},"content":[{"type":"content","content":{"type":"text","text":"file.go\n"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if got[0].Tool != "terminal" {
+		t.Errorf("orphan ToolUse tool: got %q", got[0].Tool)
+	}
+	if cmd, _ := got[0].Input["command"].(string); cmd != "ls" {
+		t.Errorf("orphan ToolUse input.command: got %v", got[0].Input["command"])
+	}
+	if got[1].Output != "file.go\n" {
+		t.Errorf("ToolResult output: got %q", got[1].Output)
+	}
+}
+
+// TestHermesClientHandleToolCallRawOutputTakesPrecedence keeps hermes
+// behaviour unchanged: when the update has both `rawOutput` (hermes
+// convention) and `content` (would be ambiguous), honour rawOutput.
+func TestHermesClientHandleToolCallRawOutputTakesPrecedence(t *testing.T) {
+	t.Parallel()
+
+	var got Message
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			got = msg
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc","status":"completed","rawOutput":"raw wins","content":[{"type":"content","content":{"type":"text","text":"ignored"}}]}}}`
+	c.handleLine(line)
+
+	if got.Output != "raw wins" {
+		t.Errorf("output: got %q, want %q", got.Output, "raw wins")
+	}
+}
+
+func TestExtractACPToolCallText(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		json string
+		want string
+	}{
+		{
+			name: "single text block",
+			json: `[{"type":"content","content":{"type":"text","text":"hello"}}]`,
+			want: "hello",
+		},
+		{
+			name: "multiple text blocks join with newline",
+			json: `[{"type":"content","content":{"type":"text","text":"a"}},{"type":"content","content":{"type":"text","text":"b"}}]`,
+			want: "a\nb",
+		},
+		{
+			name: "terminal blocks skipped",
+			json: `[{"type":"terminal","terminalId":"t1"},{"type":"content","content":{"type":"text","text":"shell out"}}]`,
+			want: "shell out",
+		},
+		{
+			name: "diff block renders as mini header",
+			json: `[{"type":"diff","path":"foo.go","oldText":"abc","newText":"abcdef"}]`,
+			want: "--- foo.go\n+++ foo.go\n(edited: 3 → 6 bytes)",
+		},
+		{
+			name: "new-file diff (no oldText)",
+			json: `[{"type":"diff","path":"new.go","oldText":"","newText":"hi"}]`,
+			want: "--- new.go\n+++ new.go\n(new file, 2 bytes)",
+		},
+		{
+			name: "empty array returns empty",
+			json: `[]`,
+			want: "",
+		},
+		{
+			name: "no text content",
+			json: `[{"type":"terminal","terminalId":"t1"}]`,
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var blocks []json.RawMessage
+			if err := json.Unmarshal([]byte(tt.json), &blocks); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := extractACPToolCallText(blocks); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHermesClientHandleToolCallInProgressIgnored(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			called = true
+		},
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-abc123","status":"in_progress"}}}`
+	c.handleLine(line)
+
+	if called {
+		t.Error("expected in_progress tool_call_update to be ignored")
+	}
+}
+
+func TestHermesClientHandleUsageUpdate(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"usage_update","usage":{"inputTokens":500,"outputTokens":200,"cachedReadTokens":100}}}}`
+	c.handleLine(line)
+
+	c.usageMu.Lock()
+	defer c.usageMu.Unlock()
+
+	if c.usage.InputTokens != 500 {
+		t.Errorf("inputTokens: got %d, want 500", c.usage.InputTokens)
+	}
+	if c.usage.OutputTokens != 200 {
+		t.Errorf("outputTokens: got %d, want 200", c.usage.OutputTokens)
+	}
+	if c.usage.CacheReadTokens != 100 {
+		t.Errorf("cacheReadTokens: got %d, want 100", c.usage.CacheReadTokens)
+	}
+}
+
+func TestHermesClientHandleUsageUpdateCumulative(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+
+	// First usage update.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"usage_update","usage":{"inputTokens":100,"outputTokens":50}}}}`)
+
+	// Second usage update with higher values (should take the max).
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"usage_update","usage":{"inputTokens":300,"outputTokens":120}}}}`)
+
+	c.usageMu.Lock()
+	defer c.usageMu.Unlock()
+
+	if c.usage.InputTokens != 300 {
+		t.Errorf("inputTokens: got %d, want 300", c.usage.InputTokens)
+	}
+	if c.usage.OutputTokens != 120 {
+		t.Errorf("outputTokens: got %d, want 120", c.usage.OutputTokens)
+	}
+}
+
+// ── extractPromptResult ──
+
+func TestHermesClientExtractPromptResult(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{"stopReason":"end_turn","usage":{"inputTokens":1000,"outputTokens":200,"cachedReadTokens":50}}`)
+	c.extractPromptResult(data)
+
+	if got.stopReason != "end_turn" {
+		t.Errorf("stopReason: got %q, want %q", got.stopReason, "end_turn")
+	}
+	if got.usage.InputTokens != 1000 {
+		t.Errorf("inputTokens: got %d, want 1000", got.usage.InputTokens)
+	}
+	if got.usage.OutputTokens != 200 {
+		t.Errorf("outputTokens: got %d, want 200", got.usage.OutputTokens)
+	}
+	if got.usage.CacheReadTokens != 50 {
+		t.Errorf("cacheReadTokens: got %d, want 50", got.usage.CacheReadTokens)
+	}
+}
+
+func TestHermesClientExtractPromptResultNoUsage(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{"stopReason":"cancelled"}`)
+	c.extractPromptResult(data)
+
+	if got.stopReason != "cancelled" {
+		t.Errorf("stopReason: got %q, want %q", got.stopReason, "cancelled")
+	}
+	if got.usage.InputTokens != 0 {
+		t.Errorf("inputTokens: got %d, want 0", got.usage.InputTokens)
+	}
+}
+
+// TestHermesClientExtractPromptResultMetaUsage covers the Grok Build ACP
+// shape: session/prompt returns only stopReason at the top level, with token
+// counters under `_meta.usage` (and mirrored flat fields on `_meta`).
+// Captured from grok 0.2.106 against a live `grok agent stdio` session.
+func TestHermesClientExtractPromptResultMetaUsage(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	// Minimal real-world payload (ids truncated). Nested usage is the
+	// authoritative block; flat _meta counters mirror it.
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"_meta": {
+			"sessionId": "019f8516-4fee-7c23-9766-ec748929e01a",
+			"modelId": "grok-4.5",
+			"inputTokens": 12929,
+			"outputTokens": 29,
+			"cachedReadTokens": 10880,
+			"reasoningTokens": 24,
+			"usage": {
+				"inputTokens": 12929,
+				"outputTokens": 29,
+				"totalTokens": 12958,
+				"cachedReadTokens": 10880,
+				"reasoningTokens": 24,
+				"modelCalls": 1,
+				"costUsdTicks": 75360000
+			}
+		}
+	}`)
+	c.extractPromptResult(data)
+
+	if got.stopReason != "end_turn" {
+		t.Errorf("stopReason: got %q, want %q", got.stopReason, "end_turn")
+	}
+	// Grok counts the cached prefix inside inputTokens (totalTokens 12958 ==
+	// 12929 + 29), so the stored input bucket is the uncached remainder:
+	// 12929 - 10880 = 2049. Priced at xAI's grok-4.5 rates that is
+	// 2049*$2 + 10880*$0.30 + 29*$6 per 1M = $0.007536, which is exactly the
+	// costUsdTicks the same payload reports.
+	if got.usage.InputTokens != 2049 {
+		t.Errorf("inputTokens: got %d, want 2049", got.usage.InputTokens)
+	}
+	if got.usage.OutputTokens != 29 {
+		t.Errorf("outputTokens: got %d, want 29", got.usage.OutputTokens)
+	}
+	if got.usage.CacheReadTokens != 10880 {
+		t.Errorf("cacheReadTokens: got %d, want 10880", got.usage.CacheReadTokens)
+	}
+	// The turn stamps the model it billed against. A resumed session has no
+	// other source for this (session/load reports no model id), so losing it
+	// buckets the whole run under "unknown", which prices at $0.
+	if got.modelID != "grok-4.5" {
+		t.Errorf("modelID: got %q, want %q", got.modelID, "grok-4.5")
+	}
+	// xAI's own price for the turn, in ticks of 1e-10 USD. This is the only
+	// figure that carries request-level pricing rules (the ≥200K prompt
+	// surcharge); dropping it forces a rate-table guess downstream.
+	if got.usage.CostUSDTicks != 75360000 {
+		t.Errorf("costUsdTicks: got %d, want 75360000", got.usage.CostUSDTicks)
+	}
+	if usd := float64(got.usage.CostUSDTicks) / CostUSDTicksPerUSD; math.Abs(usd-0.007536) > 1e-12 {
+		t.Errorf("cost in USD: got %v, want 0.007536", usd)
+	}
+}
+
+// TestParseACPTokenUsageCostIsOptional guards the common case: almost no agent
+// reports a cost, and a zero must stay zero so the reader knows to estimate
+// rather than recording a real $0 spend.
+func TestParseACPTokenUsageCostIsOptional(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{name: "camelCase", raw: `{"inputTokens":10,"costUsdTicks":4200}`, want: 4200},
+		{name: "snake_case", raw: `{"input_tokens":10,"cost_usd_ticks":4200}`, want: 4200},
+		{name: "absent", raw: `{"inputTokens":10,"outputTokens":2}`, want: 0},
+		{name: "null", raw: `{"inputTokens":10,"costUsdTicks":null}`, want: 0},
+		{name: "string number", raw: `{"inputTokens":10,"costUsdTicks":"4200"}`, want: 4200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseACPTokenUsage(json.RawMessage(tc.raw)).CostUSDTicks; got != tc.want {
+				t.Errorf("CostUSDTicks: got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseACPModelIDFromMeta covers the shapes the `_meta` model id can
+// arrive in, and confirms a missing one degrades to empty rather than
+// inventing an attribution.
+func TestParseACPModelIDFromMeta(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "camelCase", raw: `{"modelId":"grok-4.5"}`, want: "grok-4.5"},
+		{name: "snake_case", raw: `{"model_id":"grok-4.3"}`, want: "grok-4.3"},
+		{name: "camelCase wins over snake_case", raw: `{"modelId":"grok-4.5","model_id":"grok-4.3"}`, want: "grok-4.5"},
+		{name: "whitespace trimmed", raw: `{"modelId":"  grok-4.5  "}`, want: "grok-4.5"},
+		{name: "absent", raw: `{"sessionId":"ses_1"}`, want: ""},
+		{name: "empty string", raw: `{"modelId":""}`, want: ""},
+		{name: "null meta", raw: `null`, want: ""},
+		{name: "malformed", raw: `{"modelId":`, want: ""},
+		{name: "wrong type degrades to empty", raw: `{"modelId":42}`, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseACPModelIDFromMeta(json.RawMessage(tc.raw)); got != tc.want {
+				t.Errorf("parseACPModelIDFromMeta(%s): got %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHermesClientExtractPromptResultMetaFlatOnly covers agents that put
+// counters on `_meta` without a nested `usage` object.
+func TestHermesClientExtractPromptResultMetaFlatOnly(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"_meta": {
+			"inputTokens": 50,
+			"outputTokens": 10,
+			"cachedReadTokens": 5
+		}
+	}`)
+	c.extractPromptResult(data)
+
+	if got.usage.InputTokens != 50 || got.usage.OutputTokens != 10 || got.usage.CacheReadTokens != 5 {
+		t.Fatalf("unexpected usage from flat _meta: %+v", got.usage)
+	}
+}
+
+// TestHermesClientExtractPromptResultTopLevelBeatsMeta ensures the standard
+// ACP top-level `usage` field still wins when both shapes are present.
+func TestHermesClientExtractPromptResultTopLevelBeatsMeta(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"usage": {"inputTokens": 1, "outputTokens": 2},
+		"_meta": {"usage": {"inputTokens": 999, "outputTokens": 999}}
+	}`)
+	c.extractPromptResult(data)
+
+	if got.usage.InputTokens != 1 || got.usage.OutputTokens != 2 {
+		t.Fatalf("top-level usage should win: %+v", got.usage)
+	}
+}
+
+// TestHermesClientExtractPromptResultTopLevelZeroFallsBackToMeta pins the
+// semantic-empty behavior: an explicit top-level usage object with no
+// effective counters must not hide usable metering supplied by the agent in
+// _meta.
+func TestHermesClientExtractPromptResultTopLevelZeroFallsBackToMeta(t *testing.T) {
+	t.Parallel()
+
+	var got hermesPromptResult
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onPromptDone: func(result hermesPromptResult) {
+			got = result
+		},
+	}
+
+	data := json.RawMessage(`{
+		"stopReason": "end_turn",
+		"usage": {
+			"inputTokens": 0,
+			"outputTokens": 0,
+			"cacheReadTokens": 0,
+			"cacheWriteTokens": 0
+		},
+		"_meta": {
+			"usage": {
+				"inputTokens": 100,
+				"outputTokens": 20,
+				"cachedReadTokens": 5,
+				"cachedWriteTokens": 2
+			}
+		}
+	}`)
+	c.extractPromptResult(data)
+
+	want := TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 5, CacheWriteTokens: 2}
+	if got.usage.TokenUsage != want {
+		t.Fatalf("zero top-level usage should fall back to _meta: got %+v, want %+v", got.usage, want)
+	}
+}
+
+func TestHermesClientIgnoresUnknownNotification(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+		onMessage: func(msg Message) {
+			called = true
+		},
+	}
+
+	// Unknown method should be silently ignored.
+	c.handleLine(`{"jsonrpc":"2.0","method":"unknown/event","params":{}}`)
+
+	if called {
+		t.Error("expected unknown notification to be ignored")
+	}
+}
+
+func TestHermesClientIgnoresInvalidJSON(t *testing.T) {
+	t.Parallel()
+
+	c := &hermesClient{
+		pending: make(map[int]*pendingRPC),
+	}
+
+	// Should not panic.
+	c.handleLine("not json at all")
+	c.handleLine("")
+	c.handleLine("{}")
+}
+
+func TestHermesProviderErrorSniffer(t *testing.T) {
+	t.Parallel()
+
+	// Real sample of the stderr hermes emits when the configured
+	// LLM endpoint rejects the requested model. We verify the
+	// sniffer extracts the `Error: ...` line so the task error
+	// tells the user *why* it failed.
+	s := newACPProviderErrorSniffer("hermes")
+	lines := []string{
+		"2026-04-20 23:41:47 [INFO] acp_adapter.server: Prompt on session abc",
+		`⚠️  API call failed (attempt 1/3): BadRequestError [HTTP 400]`,
+		`   🔌 Provider: openai-codex  Model: gpt-5.1-codex-mini`,
+		`   📝 Error: HTTP 400: Error code: 400 - {'detail': "The 'gpt-5.1-codex-mini' model is not supported when using Codex with a ChatGPT account."}`,
+		`⏱️  Elapsed: 1.17s`,
+	}
+	for _, line := range lines {
+		if _, err := s.Write([]byte(line + "\n")); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	msg := s.message()
+	if msg == "" {
+		t.Fatal("expected a non-empty error message")
+	}
+	if !strings.Contains(msg, "model is not supported") {
+		t.Errorf("expected detail about model support, got %q", msg)
+	}
+}
+
+func TestHermesProviderErrorSnifferIgnoresInfoLines(t *testing.T) {
+	t.Parallel()
+
+	s := newACPProviderErrorSniffer("hermes")
+	s.Write([]byte("2026-04-20 23:41:45 [INFO] acp_adapter.entry: Loaded env\n"))
+	s.Write([]byte("2026-04-20 23:41:47 [INFO] agent.auxiliary_client: Vision auto-detect...\n"))
+	if msg := s.message(); msg != "" {
+		t.Errorf("info lines should produce no error, got %q", msg)
+	}
+}
+
+func TestHermesProviderErrorSnifferHandlesPartialLines(t *testing.T) {
+	t.Parallel()
+
+	// Writer may be called mid-line; the sniffer must buffer until
+	// it sees a newline so the regex doesn't miss the header.
+	s := newACPProviderErrorSniffer("hermes")
+	s.Write([]byte(`⚠️  API call failed (attempt 1/3):`))
+	s.Write([]byte(` BadRequestError [HTTP 400]` + "\n"))
+	s.Write([]byte(`   📝 Error: something went wrong` + "\n"))
+	msg := s.message()
+	if !strings.Contains(msg, "something went wrong") {
+		t.Errorf("expected buffered line to be captured, got %q", msg)
+	}
+}
+
+func TestHermesProviderErrorSnifferBoundedBuffer(t *testing.T) {
+	t.Parallel()
+
+	s := newACPProviderErrorSniffer("hermes")
+	for i := 0; i < 20; i++ {
+		// Each line differs so dedup doesn't merge them.
+		s.Write([]byte(`⚠️  API call failed (HTTP 400) attempt ` + string(rune('a'+i%26)) + `: Non-retryable error` + "\n"))
+	}
+	if len(s.lines) > acpMaxErrorLines {
+		t.Errorf("sniffer kept %d lines, limit is %d", len(s.lines), acpMaxErrorLines)
+	}
+}
+
+// TestHermesProviderErrorSnifferIgnoresEchoedInfoRecords guards pollution
+// failures from GitHub multica#5862.
+//
+// Pollution failure ≠ real provider failure:
+//   - real failure: Hermes/provider crashes; no successful final reply.
+//   - pollution failure: Hermes already produced a correct final reply /
+//     completed the requested work, then Multica suddenly flips the same
+//     run to failed because an `[INFO] root:` conversation/tool echo on
+//     stderr embedded error-looking tokens (Error:, KeyError:, ❌, ...).
+//
+// These fixtures model the pollution class. The sniffer must ignore the
+// full INFO record, and a completed run with a successful final reply
+// must stay completed.
+func TestHermesProviderErrorSnifferIgnoresEchoedInfoRecords(t *testing.T) {
+	t.Parallel()
+
+	oversizedDoc := `2026-07-24 10:08:59 [INFO] root: {"message":{"role":"tool","content":"` +
+		"# ❌ Deprecated approach: do not use this query. " +
+		strings.Repeat("reference documentation body ... ", 500) +
+		`The parser may return KeyError: 'series'; inspect the response shape first."}}`
+
+	tests := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "oversized documentation payload",
+			line: oversizedDoc,
+		},
+		{
+			name: "short tool result payload",
+			line: `2026-07-24 10:09:00 [INFO] root: {"message":{"role":"tool","content":"# ❌ Deprecated example. KeyError: 'series' means the optional field is absent."}}`,
+		},
+		{
+			name: "short llm call payload",
+			line: `2026-07-24 10:09:01 [INFO] root: {"type":"llm_call","finish_reason":"tool_calls","arguments":"print(f\"Error: {err}\")","reasoning_content":"❌ This sample is intentionally invalid."}`,
+		},
+		{
+			name: "provider-looking text inside info payload",
+			line: `2026-07-24 10:09:02 [INFO] root: {"message":{"role":"tool","content":"Troubleshooting example: ❌ API call failed after 3 retries: HTTP 429. This is quoted documentation, not the current run."}}`,
+		},
+	}
+
+	if len(oversizedDoc) < acpMaxErrorLineLen {
+		t.Fatalf("oversized fixture is %d bytes, below the cap %d", len(oversizedDoc), acpMaxErrorLineLen)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newACPProviderErrorSniffer("hermes")
+			if _, err := s.Write([]byte(tt.line + "\n")); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if msg := s.message(); msg != "" {
+				t.Errorf("echoed INFO record must not be captured, got %d bytes: %q", len(msg), firstNRunes(msg, 100))
+			}
+			if msg := s.terminalMessage(); msg != "" {
+				t.Errorf("echoed INFO record must not set terminal failure, got %d bytes: %q", len(msg), firstNRunes(msg, 100))
+			}
+
+			// Simulate the observed pollution timing: a successful final
+			// reply already exists, then promotion consults the sniffer.
+			successfulFinalReply := "Done. The requested work completed successfully."
+			status, errStr := promoteACPResultOnProviderError("completed", "", successfulFinalReply, s)
+			if status != "completed" {
+				t.Errorf("pollution: successful final reply was present, but status flipped to %q (error=%q)", status, firstNRunes(errStr, 100))
+			}
+		})
+	}
+}
+
+// TestHermesProviderErrorSnifferStillCapturesErrorRootRecords is the
+// control for real failures: genuine `[ERROR] root:` provider records
+// must still be terminal. Pollution handling must not swallow those.
+func TestHermesProviderErrorSnifferStillCapturesErrorRootRecords(t *testing.T) {
+	t.Parallel()
+
+	s := newACPProviderErrorSniffer("hermes")
+	line := `2026-07-24 10:09:03 [ERROR] root: ❌ API call failed after 3 retries: HTTP 429 rate limit exceeded`
+	if _, err := s.Write([]byte(line + "\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	msg := s.terminalMessage()
+	if !strings.Contains(msg, "HTTP 429") {
+		t.Fatalf("real error: expected genuine ERROR root record to remain terminal, got %q", msg)
+	}
+}
+
+// TestHermesProviderErrorSnifferIgnoresMultiLineInfoRecords guards the
+// second pollution shape from GitHub multica#5862. Hermes echoes a
+// conversation/tool record whose JSON spans several physical lines: only
+// the first line carries the `[INFO] root:` prefix, the continuation lines
+// do not, yet they may embed both a capture token (`Error:`) and a terminal
+// token (`❌`) on the same physical line. The whole record must be skipped,
+// so a completed run with a successful final reply stays completed.
+func TestHermesProviderErrorSnifferIgnoresMultiLineInfoRecords(t *testing.T) {
+	t.Parallel()
+
+	record := "2026-07-24 10:09:00 [INFO] root: {\n" +
+		"  \"message\": {\"role\": \"tool\", \"content\": \"❌ Error: KeyError 'series' is quoted documentation, not a provider failure\"}\n" +
+		"}\n"
+
+	s := newACPProviderErrorSniffer("hermes")
+	for _, physicalLine := range strings.SplitAfter(record, "\n") {
+		if physicalLine == "" {
+			continue
+		}
+		if _, err := s.Write([]byte(physicalLine)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if msg := s.message(); msg != "" {
+		t.Errorf("multi-line INFO echo must not be captured, got %q", firstNRunes(msg, 120))
+	}
+	if msg := s.terminalMessage(); msg != "" {
+		t.Errorf("multi-line INFO echo must not be terminal, got %q", firstNRunes(msg, 120))
+	}
+	status, errStr := promoteACPResultOnProviderError("completed", "", "Done. The requested work completed successfully.", s)
+	if status != "completed" {
+		t.Errorf("multi-line INFO echo flipped a completed run to %q (error=%q)", status, firstNRunes(errStr, 120))
+	}
+}
+
+// TestHermesProviderErrorSnifferErrorRecordAfterInfoRecord is the control
+// for the multi-line skip: a genuine `[ERROR] root:` record that FOLLOWS a
+// multi-line INFO echo must still be terminal. The error record's own
+// prefix ends the skipped INFO record, so real failures are not swallowed.
+func TestHermesProviderErrorSnifferErrorRecordAfterInfoRecord(t *testing.T) {
+	t.Parallel()
+
+	stream := "2026-07-24 10:09:00 [INFO] root: {\n" +
+		"  \"content\": \"❌ Error: harmless echoed documentation\"\n" +
+		"}\n" +
+		"2026-07-24 10:09:05 [ERROR] root: ❌ API call failed after 3 retries: HTTP 429 rate limit exceeded\n"
+
+	s := newACPProviderErrorSniffer("hermes")
+	if _, err := s.Write([]byte(stream)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	msg := s.terminalMessage()
+	if !strings.Contains(msg, "HTTP 429") {
+		t.Fatalf("real ERROR record after an INFO echo must stay terminal, got %q", msg)
+	}
+}
+
+// TestHermesProviderErrorSnifferRealErrorsAfterSingleLineInfo guards record
+// boundaries around INFO echoes. A complete single-line INFO record must not
+// make a following bare provider-error block or a non-root logger record look
+// like an INFO continuation.
+func TestHermesProviderErrorSnifferRealErrorsAfterSingleLineInfo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		stream string
+	}{
+		{
+			name: "bare provider error",
+			stream: "2026-07-24 10:09:00 [INFO] root: {\"message\":\"ordinary echo with an unmatched { in quoted text\"}\n" +
+				"❌ API call failed after 3 retries: RateLimitError [HTTP 429]\n" +
+				"📝 Error: HTTP 429 rate limit exceeded\n",
+		},
+		{
+			name: "non-root error logger",
+			stream: "2026-07-24 10:09:00 [INFO] root: {\"message\":\"ordinary echo\"}\n" +
+				"2026-07-24 10:09:01 [ERROR] acp_adapter.server: ❌ API call failed after 3 retries: HTTP 429 rate limit exceeded\n",
+		},
+		{
+			name: "bare provider error after echo truncated inside string",
+			stream: "2026-07-24 10:09:00 [INFO] root: {\"message\":\"truncated echo\n" +
+				"❌ API call failed after 3 retries: RateLimitError [HTTP 429]\n" +
+				"📝 Error: HTTP 429 rate limit exceeded\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newACPProviderErrorSniffer("hermes")
+			if _, err := s.Write([]byte(tt.stream)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if msg := s.terminalMessage(); !strings.Contains(msg, "HTTP 429") {
+				t.Fatalf("real provider error after a single-line INFO record was swallowed, got %q", msg)
+			}
+		})
+	}
+}
+
+// TestHermesProviderErrorSnifferLongRealErrorStillFails guards the #1952
+// regression: a genuine provider failure emitted as one long line (well
+// over acpMaxErrorLineLen) with no successful output must still fail the
+// run. Length must never decide whether a line is an error. The shared
+// sniffer backs hermes/kimi/kiro/qoder/grok/traecli, so verify the
+// non-Hermes callers too, and confirm the persisted message stays bounded.
+func TestHermesProviderErrorSnifferLongRealErrorStillFails(t *testing.T) {
+	t.Parallel()
+
+	longReal := "❌ API call failed after 3 retries: BadRequestError [HTTP 400] " +
+		"Error: HTTP 400: Error code: 400 - {'detail': \"" +
+		strings.Repeat("the requested model is not supported for this account; ", 200) +
+		"\"}"
+	if len(longReal) <= acpMaxErrorLineLen {
+		t.Fatalf("fixture is %d bytes, must exceed the cap %d to exercise the path", len(longReal), acpMaxErrorLineLen)
+	}
+
+	for _, provider := range []string{"hermes", "kimi", "reasonix", "kiro", "qoder", "grok", "traecli"} {
+		t.Run(provider, func(t *testing.T) {
+			s := newACPProviderErrorSniffer(provider)
+			if _, err := s.Write([]byte(longReal + "\n")); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			// Empty output: no successful reply to fall back on (#1952).
+			status, errStr := promoteACPResultOnProviderError("completed", "", "", s)
+			if status != "failed" {
+				t.Fatalf("long real provider error was dropped; run stayed %q instead of failed", status)
+			}
+			if errStr == "" {
+				t.Fatal("failed run must carry a non-empty provider-error message")
+			}
+			if len(errStr) > acpMaxErrorLineLen+len("…(truncated)") {
+				t.Errorf("persisted error not bounded: %d bytes", len(errStr))
+			}
+		})
+	}
+}
+
+// firstNRunes returns at most n runes of s, for bounded error output.
+func firstNRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+func fakeHermesACPUsageWithDefaultModelScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_model","models":{"currentModelId":"nous:moonshotai/kimi-k2.6","availableModels":[{"modelId":"nous:moonshotai/kimi-k2.6","name":"moonshotai/kimi-k2.6"}]}}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      if [ -n "$HERMES_LATE_USAGE" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"inputTokens":120,"outputTokens":30,"totalTokens":150,"cachedReadTokens":20,"cachedWriteTokens":7,"costUsdTicks":400}}}\n' "$id"
+        sleep 0.05
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_model","update":{"sessionUpdate":"usage_update","usage":{"inputTokens":300,"outputTokens":120,"cachedReadTokens":80,"costUsdTicks":900}}}}\n'
+        exit 0
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"inputTokens":17,"outputTokens":5,"cachedReadTokens":3,"cachedWriteTokens":2,"costUsdTicks":900}}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+func TestHermesBackendAttributesUsageToACPDefaultModel(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPUsageWithDefaultModelScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+		if _, ok := result.Usage["unknown"]; ok {
+			t.Fatalf("usage should not be attributed to unknown: %+v", result.Usage)
+		}
+		usage, ok := result.Usage["nous:moonshotai/kimi-k2.6"]
+		if !ok {
+			t.Fatalf("expected usage under Hermes current model, got %+v", result.Usage)
+		}
+		if usage != (TokenUsage{InputTokens: 17, OutputTokens: 5, CacheReadTokens: 3, CacheWriteTokens: 2, CostUSDTicks: 900}) {
+			t.Fatalf("usage = %+v, want all prompt-result fields", usage)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+func TestHermesBackendMergesLateCumulativeUsageAfterPromptResponse(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPUsageWithDefaultModelScript()))
+
+	backend, err := New("hermes", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env:            map[string]string{"HERMES_LATE_USAGE": "1"},
+	})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	session, err := backend.Execute(context.Background(), "prompt", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	result := <-session.Result
+	if result.Status != "completed" {
+		t.Fatalf("status=%q error=%q", result.Status, result.Error)
+	}
+	want := TokenUsage{InputTokens: 300, OutputTokens: 120, CacheReadTokens: 80, CacheWriteTokens: 7, CostUSDTicks: 900}
+	if usage := result.Usage["nous:moonshotai/kimi-k2.6"]; usage != want {
+		t.Fatalf("usage = %+v, want %+v", usage, want)
+	}
+}
+
+// fakeHermesACPRateLimitScript impersonates hermes for the GitHub
+// multica#1952 scenario: the upstream LLM returns HTTP 429 (rate
+// limited / no credit), hermes retries internally and ultimately
+// emits both a sniffable stderr error block AND a synthetic agent
+// text turn ("API call failed after 3 retries..."), then completes
+// session/prompt with stopReason=end_turn (NOT an RPC error). The
+// daemon must still treat this as a failed run, not a successful
+// one — which means the hermes backend has to promote the status
+// to "failed" even though `output` is non-empty.
+func fakeHermesACPRateLimitScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_429"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      # Mimic hermes' real-world stderr block on a 429.
+      printf '%s\n' '⚠️  API call failed (attempt 3/3): RateLimitError [HTTP 429]' >&2
+      printf '%s\n' '   📝 Error: HTTP 429: The usage limit has been reached' >&2
+      # Mimic hermes injecting the failure as a synthetic agent turn so
+      # the chat shows *something*; this puts text in output and used to
+      # mask the failure from the daemon.
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_429","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"API call failed after 3 retries: HTTP 429: The usage limit has been reached"}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// TestHermesProviderErrorSnifferTerminalVsTransient verifies the
+// sniffer reports terminalMessage()=="" for a per-attempt warning
+// that did NOT escalate to an exhausted/non-retryable failure, but
+// still returns the same string from message() so callers wanting
+// diagnostic text can use it. This is what prevents the
+// promote-on-any-sniff false positive (a transient `attempt 1/3`
+// followed by a successful retry must stay "completed").
+func TestHermesProviderErrorSnifferTerminalVsTransient(t *testing.T) {
+	t.Parallel()
+
+	// Transient: the sniffer DID see something matching acpErrorHeaderRe
+	// (so `message()` is non-empty for diagnostic purposes), but the
+	// signal is just "attempt 1/3 against a retryable rate limit" — no
+	// terminal markers at all.
+	s := newACPProviderErrorSniffer("hermes")
+	s.Write([]byte("⚠️  API call failed (attempt 1/3): retryable upstream blip\n"))
+	if msg := s.message(); msg == "" {
+		t.Fatalf("sniffer should still capture transient warnings for diagnostics")
+	}
+	if msg := s.terminalMessage(); msg != "" {
+		t.Fatalf("transient attempt should NOT be a terminal failure, got %q", msg)
+	}
+
+	// Now feed a follow-on terminal marker. terminalMessage must turn on.
+	s.Write([]byte("❌  API call failed after 3 retries: usage limit reached\n"))
+	if msg := s.terminalMessage(); msg == "" {
+		t.Fatalf("after-N-retries / ❌ should switch terminalMessage on")
+	}
+}
+
+// TestHermesProviderErrorSnifferTerminalNonRetryable verifies that a
+// non-retryable error (BadRequest / Authentication / Non-retryable)
+// is treated as terminal even on attempt 1/3 — those errors don't
+// retry, so the very first failure is the final disposition. Also
+// covers ❌ / [ERROR] / "after N retries" markers that adapters
+// emit on give-up.
+func TestHermesProviderErrorSnifferTerminalNonRetryable(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range []string{
+		`⚠️  API call failed (attempt 1/3): BadRequestError [HTTP 400]`,
+		`⚠️  API call failed (attempt 1/3): AuthenticationError [HTTP 401]`,
+		`⚠️  API call failed (HTTP 400) attempt a: Non-retryable error`,
+		`❌ API call failed after 3 retries: RateLimitError [HTTP 429]`,
+		`[ERROR] API call failed: upstream returned HTTP 500`,
+	} {
+		s := newACPProviderErrorSniffer("hermes")
+		s.Write([]byte(line + "\n"))
+		if msg := s.terminalMessage(); msg == "" {
+			t.Errorf("expected %q to be classified as terminal", line)
+		}
+	}
+}
+
+// TestACPProviderErrorSnifferKimiApiError covers the kimi-specific error
+// format that was previously invisible to the sniffer, causing tasks to
+// silently complete instead of failing (GitHub multica#5760):
+//
+//	error: failed to run prompt: provider.api_error: 400 the message at
+//	position 43 with role 'assistant' must not be empty
+//
+// The line has no emoji prefix and uses lowercase "error:", so the original
+// acpErrorHeaderRe / acpErrorDetailRe did not capture it. The fix adds
+// provider.api_error as an additional header match, recognises 4xx codes as
+// terminal, and extracts the error message after "provider.api_error: NNN ".
+func TestACPProviderErrorSnifferKimiApiError(t *testing.T) {
+	t.Parallel()
+
+	stderr := "error: failed to run prompt: provider.api_error: 400 the message at position 43 with role 'assistant' must not be empty\n"
+	s := newACPProviderErrorSniffer("kimi")
+	if _, err := s.Write([]byte(stderr)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	msg := s.terminalMessage()
+	if msg == "" {
+		t.Fatal("expected a non-empty terminal message; sniffer did not recognise provider.api_error line")
+	}
+	if !strings.Contains(msg, "must not be empty") {
+		t.Errorf("expected error detail about empty assistant message, got %q", msg)
+	}
+	if !strings.Contains(msg, "kimi") {
+		t.Errorf("expected provider prefix 'kimi' in message, got %q", msg)
+	}
+
+	// promoteACPResultOnProviderError must flip completed→failed so resumed
+	// sessions with a permanently broken history surface as task failures.
+	finalStatus, finalError := promoteACPResultOnProviderError("completed", "", "", s)
+	if finalStatus != "failed" {
+		t.Errorf("status = %q, want %q", finalStatus, "failed")
+	}
+	if !strings.Contains(finalError, "must not be empty") {
+		t.Errorf("error = %q, want it to mention the empty assistant message", finalError)
+	}
+}
+
+// TestACPProviderErrorSnifferKimiApiError5xx verifies that a 5xx
+// provider.api_error (potentially transient) is captured but not classified
+// as terminal, so it only promotes to failed when output is also empty.
+func TestACPProviderErrorSnifferKimiApiError5xx(t *testing.T) {
+	t.Parallel()
+
+	stderr := "error: provider.api_error: 503 upstream temporarily unavailable\n"
+	s := newACPProviderErrorSniffer("kimi")
+	s.Write([]byte(stderr))
+
+	if s.terminalMessage() != "" {
+		t.Error("5xx provider.api_error should not be classified as terminal")
+	}
+	if s.message() == "" {
+		t.Error("5xx provider.api_error should still be captured as a non-terminal error")
+	}
+}
+
+// TestACPProviderErrorSnifferKimiRateLimitNotTerminal verifies that a
+// kimi-style 429 is captured for diagnostic purposes but is NOT marked
+// as terminal. The kimi adapter retries rate-limit errors internally;
+// a run that ultimately succeeds must stay status=completed regardless
+// of how many 429 warnings appeared on stderr during retries.
+func TestACPProviderErrorSnifferKimiRateLimitNotTerminal(t *testing.T) {
+	t.Parallel()
+
+	s := newACPProviderErrorSniffer("kimi")
+	s.Write([]byte("error: failed to run prompt: provider.api_error: 429 rate limit exceeded\n"))
+
+	if msg := s.terminalMessage(); msg != "" {
+		t.Errorf("429 should not be terminal, got %q", msg)
+	}
+	if msg := s.message(); msg == "" {
+		t.Error("429 should still be captured for diagnostics (message() must be non-empty)")
+	}
+
+	// promoteACPResultOnProviderError must leave status=completed when the
+	// adapter ultimately produced a real answer after internal retries.
+	finalStatus, _ := promoteACPResultOnProviderError("completed", "", "here is the answer", s)
+	if finalStatus != "completed" {
+		t.Errorf("status = %q, want completed: 429 + non-empty output must not be promoted to failed", finalStatus)
+	}
+}
+
+// TestACPProviderErrorSnifferPoisonedHistory verifies that the
+// "provider.api_error: 400 … must not be empty" pattern is detected as a
+// poisoned session so the backend can set ResumeRejected=true and the daemon
+// drops the broken session pointer instead of replaying the same bad history.
+func TestACPProviderErrorSnifferPoisonedHistory(t *testing.T) {
+	t.Parallel()
+
+	// Single-line format: 400 + role 'assistant' + must not be empty on the
+	// same line. This is the format emitted by some kimi-cli versions.
+	s := newACPProviderErrorSniffer("kimi")
+	s.Write([]byte("error: failed to run prompt: provider.api_error: 400 the message at position 43 with role 'assistant' must not be empty\n"))
+	if !s.isPoisonedHistory() {
+		t.Fatal("single-line: expected isPoisonedHistory()=true for 400 assistant-empty error")
+	}
+
+	// Two-line format: kimi emits the status on the error header and the
+	// human-readable detail on a separate "detail:" line. isPoisonedHistory
+	// must detect this across lines, not only when both markers are on the
+	// same line.
+	s4 := newACPProviderErrorSniffer("kimi")
+	s4.Write([]byte("error: failed to run prompt: provider.api_error: 400\n"))
+	s4.Write([]byte("detail: messages[43].content: content must not be empty\n"))
+	if !s4.isPoisonedHistory() {
+		t.Fatal("two-line: expected isPoisonedHistory()=true when 400 and must-not-be-empty are on separate lines")
+	}
+
+	// A plain 400 with a different error message is terminal but not a
+	// poisoned history — the session may still be healthy.
+	s2 := newACPProviderErrorSniffer("kimi")
+	s2.Write([]byte("error: failed to run prompt: provider.api_error: 400 invalid model specified\n"))
+	if s2.isPoisonedHistory() {
+		t.Error("plain 400 without must-not-be-empty should not be classified as poisoned history")
+	}
+
+	// "must not be empty" on a detail line paired with a 429 header must
+	// not match — 429 is transient and not provider.api_error: 400.
+	s5 := newACPProviderErrorSniffer("kimi")
+	s5.Write([]byte("⚠️ API call failed after 3 retries: RateLimitError [HTTP 429]\n"))
+	s5.Write([]byte("detail: field must not be empty\n"))
+	if s5.isPoisonedHistory() {
+		t.Error("429 RateLimitError with must-not-be-empty detail should not be classified as poisoned history")
+	}
+}
+
+// TestACPProviderErrorSnifferMessageLockedPreservesAPIErrorStatus verifies
+// that messageLocked forwards the "provider.api_error: NNN" prefix into the
+// formatted output even when the human-readable detail arrives on a separate
+// stderr line. This is the contract classifyPoisonedError relies on.
+func TestACPProviderErrorSnifferMessageLockedPreservesAPIErrorStatus(t *testing.T) {
+	t.Parallel()
+
+	// Two-line format: status on header, detail on next line.
+	s := newACPProviderErrorSniffer("kimi")
+	s.Write([]byte("error: failed to run prompt: provider.api_error: 400\n"))
+	s.Write([]byte("detail: messages[43].content: content must not be empty\n"))
+	msg := s.terminalMessage()
+	if !strings.Contains(msg, "provider.api_error: 400") {
+		t.Errorf("two-line: terminalMessage() should include provider.api_error: 400, got %q", msg)
+	}
+	if !strings.Contains(msg, "must not be empty") {
+		t.Errorf("two-line: terminalMessage() should include the detail text, got %q", msg)
+	}
+
+	// Single-line format: status and detail on the same line.
+	s2 := newACPProviderErrorSniffer("kimi")
+	s2.Write([]byte("error: failed to run prompt: provider.api_error: 400 the message at position 43 with role 'assistant' must not be empty\n"))
+	msg2 := s2.terminalMessage()
+	if !strings.Contains(msg2, "provider.api_error: 400") {
+		t.Errorf("single-line: terminalMessage() should include provider.api_error: 400, got %q", msg2)
+	}
+	if !strings.Contains(msg2, "must not be empty") {
+		t.Errorf("single-line: terminalMessage() should include the detail text, got %q", msg2)
+	}
+}
+
+// TestACPProviderErrorSnifferMixedRetry429Then400 verifies that when a kimi
+// adapter emits a transient 429 (internally retried) followed by a terminal
+// 400 (poisoned history), messageLocked pairs the 400 status tag with the
+// 400's own detail — not with the 429's "rate limit" text. This ensures that
+// taskfailure.UnresumableHistory can see the history locator in the final
+// surfaced error string (GitHub multica#5785 P1 from Aug 10 review).
+func TestACPProviderErrorSnifferMixedRetry429Then400(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		stderrSeq []string
+		wantIn    string
+		wantNotIn string
+	}{
+		{
+			name: "single-line 400 after 429",
+			stderrSeq: []string{
+				"error: provider.api_error: 429 rate limit exceeded\n",
+				"error: provider.api_error: 400 the message at position 43 with role 'assistant' must not be empty\n",
+			},
+			wantIn:    "must not be empty",
+			wantNotIn: "rate limit",
+		},
+		{
+			name: "two-line 400 after 429",
+			stderrSeq: []string{
+				"error: provider.api_error: 429 rate limit exceeded\n",
+				"error: provider.api_error: 400\n",
+				"detail: messages[43].content: content must not be empty\n",
+			},
+			wantIn:    "must not be empty",
+			wantNotIn: "rate limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newACPProviderErrorSniffer("kimi")
+			for _, line := range tt.stderrSeq {
+				if _, err := s.Write([]byte(line)); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			msg := s.terminalMessage()
+			if !strings.Contains(msg, "provider.api_error: 400") {
+				t.Errorf("expected provider.api_error: 400 in message, got %q", msg)
+			}
+			if !strings.Contains(msg, tt.wantIn) {
+				t.Errorf("expected %q in message, got %q", tt.wantIn, msg)
+			}
+			if strings.Contains(msg, tt.wantNotIn) {
+				t.Errorf("must not include %q (from 429) in message, got %q", tt.wantNotIn, msg)
+			}
+			if !s.isPoisonedHistory() {
+				t.Error("mixed 429→400 with assistant-empty detail must be classified as poisoned history")
+			}
+		})
+	}
+}
+
+// TestACPProviderErrorSnifferFinalizeFlushesPartialLine verifies that a
+// terminal error written to stderr WITHOUT a trailing newline is still detected
+// after Finalize() is called. Without Finalize(), a process that exits after
+// writing its last line without '\n' leaves the partial line in s.remains and
+// the sniffer reports no error, causing the task to land as completed/empty.
+func TestACPProviderErrorSnifferFinalizeFlushesPartialLine(t *testing.T) {
+	t.Parallel()
+
+	const line = "error: provider.api_error: 400 the message at position 43 with role 'assistant' must not be empty"
+
+	s := newACPProviderErrorSniffer("kimi")
+	// Write without trailing newline — simulates a process that exits without '\n'.
+	if _, err := s.Write([]byte(line)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if msg := s.terminalMessage(); msg != "" {
+		t.Errorf("before Finalize: expected empty terminalMessage (partial line still buffered), got %q", msg)
+	}
+
+	s.Finalize()
+
+	msg := s.terminalMessage()
+	if msg == "" {
+		t.Fatal("after Finalize: expected non-empty terminalMessage for error written without trailing newline")
+	}
+	if !strings.Contains(msg, "must not be empty") {
+		t.Errorf("after Finalize: expected 'must not be empty' in message, got %q", msg)
+	}
+	if !strings.Contains(msg, "provider.api_error: 400") {
+		t.Errorf("after Finalize: expected 'provider.api_error: 400' in message, got %q", msg)
+	}
+}
+
+// TestACPProviderErrorSnifferNonKimiIgnoresProviderApiError verifies that the
+// kimi-specific provider.api_error patterns are scoped to kimi only. Other ACP
+// backends (hermes, grok, kiro, qoder, qwenpaw, reasonix, traecli) must not
+// classify a provider.api_error line as terminal — tool output can legitimately
+// echo such lines when calling an underlying Kimi API, and a run with real
+// output must stay completed (GitHub multica#5785 P1 from Aug 10 review).
+func TestACPProviderErrorSnifferNonKimiIgnoresProviderApiError(t *testing.T) {
+	t.Parallel()
+
+	for _, provider := range []string{"hermes", "grok", "kiro", "qoder", "qwenpaw", "reasonix", "traecli"} {
+		t.Run(provider, func(t *testing.T) {
+			s := newACPProviderErrorSniffer(provider)
+			s.Write([]byte("provider.api_error: 400 assistant must not be empty\n"))
+
+			if msg := s.terminalMessage(); msg != "" {
+				t.Errorf("provider %q: provider.api_error in tool output must not be terminal, got %q", provider, msg)
+			}
+
+			// With real output the run must stay completed even if the sniffer
+			// captured the line via a non-terminal path.
+			status, _ := promoteACPResultOnProviderError("completed", "", "successful output", s)
+			if status != "completed" {
+				t.Errorf("provider %q: run with real output must stay completed, got %q", provider, status)
+			}
+		})
+	}
+}
+
+// TestHermesBackendPromotesProviderErrorWithNonEmptyOutput pins the
+// fix for GitHub multica#1952: a hermes run that hits a 429 (or any
+// upstream provider error) must surface as Status=failed even though
+// hermes' synthetic "API call failed..." agent turn means the output
+// buffer is non-empty. Before the fix the sniffer-promotion was
+// gated on `finalOutput == ""`, so the run silently completed.
+func TestHermesBackendPromotesProviderErrorWithNonEmptyOutput(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPRateLimitScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed (sniffer should promote on 429 even with non-empty output), got %q (error=%q output=%q)", result.Status, result.Error, result.Output)
+		}
+		if !strings.Contains(result.Error, "429") && !strings.Contains(result.Error, "usage limit") {
+			t.Errorf("expected error to surface the 429 / usage-limit message, got %q", result.Error)
+		}
+		if result.SessionID != "ses_429" {
+			t.Errorf("expected session id to be preserved on failure, got %q", result.SessionID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// TestIsACPSessionNotFound pins the discrimination the resumed-session
+// recovery relies on: only a JSON-RPC -32603 whose text names a missing
+// session counts. Provider errors (429s, auth failures) and plain
+// transport errors must NOT match — those failures happen on sessions
+// that still exist, and clearing the id for them would discard a
+// healthy session.
+func TestIsACPSessionNotFound(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "hermes session not found in message",
+			err:  &acpRPCError{Method: "session/prompt", Code: -32603, Message: "Session not found"},
+			want: true,
+		},
+		{
+			name: "kiro no session found in data",
+			err:  &acpRPCError{Method: "session/prompt", Code: -32603, Message: "Internal error", Data: "No session found with id ses_abc"},
+			want: true,
+		},
+		{
+			name: "internal error without session wording",
+			err:  &acpRPCError{Method: "session/prompt", Code: -32603, Message: "Internal error", Data: "upstream provider returned HTTP 429"},
+			want: false,
+		},
+		{
+			name: "kimi session not found as invalid_params data",
+			// kimi-cli raises RequestError.invalid_params({"session_id":
+			// "Session not found"}) for every unknown-session path
+			// (src/kimi_cli/acp/server.py), so -32602 must match too.
+			err:  &acpRPCError{Method: "session/set_model", Code: -32602, Message: "Invalid params", Data: `{"session_id": "Session not found"}`},
+			want: true,
+		},
+		{
+			name: "invalid params without session wording",
+			err:  &acpRPCError{Method: "session/set_model", Code: -32602, Message: "model not available: bogus-model"},
+			want: false,
+		},
+		{
+			name: "session wording under an unrelated code",
+			err:  &acpRPCError{Method: "session/prompt", Code: -32601, Message: "Session not found"},
+			want: false,
+		},
+		{
+			name: "plain error",
+			err:  fmt.Errorf("session/prompt: Session not found (code=-32603)"),
+			want: false,
+		},
+		{
+			name: "wrapped rpc error",
+			err:  fmt.Errorf("request failed: %w", &acpRPCError{Method: "session/prompt", Code: -32603, Message: "Session not found"}),
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isACPSessionNotFound(tc.err); got != tc.want {
+				t.Errorf("isACPSessionNotFound(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// fakeHermesACPStaleResumeScript impersonates the failure shape from
+// GitHub multica#4010: session/resume succeeds and echoes back the
+// requested sessionId, and the subsequent session/prompt then fails with
+// JSON-RPC -32603 "Session not found".
+//
+// This is a real ACP shape and isACPSessionNotFound is shared by every ACP
+// backend, so it stays covered — but it is NOT what Hermes itself does. Hermes
+// reports an unknown session as a *successful* stopReason=refusal and its
+// session/resume response carries no sessionId at all; that shape is covered
+// by fakeHermesACPRefusedResumeScript below (GH #6150).
+func fakeHermesACPStaleResumeScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Session not found"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// TestHermesBackendClearsSessionIDWhenResumedSessionNotFound pins the
+// fix for GitHub multica#4010: when a resumed session turns out to be
+// gone on the agent side (resume echoes the requested id, prompt then
+// fails -32603 "Session not found"), the Result must carry an empty
+// SessionID. The daemon's resume-failure fallback keys on
+// `SessionID == ""` — with the stale id still in the Result, the retry
+// never fires and every future dispatch on the same (agent, issue)
+// loops on the dead session.
+func TestHermesBackendClearsSessionIDWhenResumedSessionNotFound(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPStaleResumeScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout:         5 * time.Second,
+		ResumeSessionID: "ses_stale",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Error, "Session not found") {
+			t.Errorf("expected error to surface the session-not-found message, got %q", result.Error)
+		}
+		if result.SessionID != "" {
+			t.Errorf("expected empty session id so the daemon's fresh-session retry fires, got %q", result.SessionID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// fakeHermesACPStaleResumeSetModelScript is the model-override variant
+// of fakeHermesACPStaleResumeScript: session/resume echoes the requested
+// sessionId back, and the dead session then surfaces at
+// session/set_model (which runs before session/prompt whenever the
+// caller picked a model) with the same -32603 "Session not found".
+func fakeHermesACPStaleResumeSetModelScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid"
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Session not found"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// TestHermesBackendClearsSessionIDWhenSetModelSessionNotFound pins the
+// set_model sibling of the prompt-path fix above: with a model
+// override, session/set_model runs before session/prompt, so a dead
+// resumed session surfaces there instead. The Result must carry an
+// empty SessionID here too, or the daemon's fresh-session retry never
+// fires for any agent configured with a model.
+func TestHermesBackendClearsSessionIDWhenSetModelSessionNotFound(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPStaleResumeSetModelScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout:         5 * time.Second,
+		ResumeSessionID: "ses_stale",
+		Model:           "some-model",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed, got %q (error=%q)", result.Status, result.Error)
+		}
+		if !strings.Contains(result.Error, `could not switch to model "some-model"`) {
+			t.Errorf("expected error to name the requested model, got %q", result.Error)
+		}
+		if result.SessionID != "" {
+			t.Errorf("expected empty session id so the daemon's fresh-session retry fires, got %q", result.SessionID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// fakeHermesACPTransientRetryScript emits a single retryable per-
+// attempt warning to stderr and then completes with a normal agent
+// text turn — the situation where the upstream LLM blipped on
+// attempt 1/3 but a subsequent attempt succeeded and produced a
+// real answer. The previous (too-broad) promotion logic would have
+// flipped this to status=failed; the fix must keep it as completed.
+func fakeHermesACPTransientRetryScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_ok"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      # Per-attempt rate-limit warning that hermes routinely logs on
+      # transient blips — the request DOES retry and succeed below.
+      printf '%s\n' '⚠️  API call failed (attempt 1/3): RateLimitError [HTTP 429]' >&2
+      # Real agent answer streamed back as a normal text turn.
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_ok","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Here is the answer you asked for."}}}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// TestHermesBackendDoesNotPromoteOnTransientRetry pins the
+// regression GPT-Boy flagged on the multica#1952 fix: a per-attempt
+// ⚠️ warning on stderr that does NOT include any terminal marker
+// ("after N retries", Non-retryable, ❌, [ERROR], BadRequest /
+// Authentication errors) and is followed by a successful agent
+// turn must stay status=completed. The previous "any sniffer line
+// → fail" rule would have wrongly marked this run as failed.
+func TestHermesBackendDoesNotPromoteOnTransientRetry(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPTransientRetryScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "completed" {
+			t.Fatalf("transient retry that ultimately succeeded must stay status=completed, got %q (error=%q output=%q)", result.Status, result.Error, result.Output)
+		}
+		if !strings.Contains(result.Output, "Here is the answer") {
+			t.Errorf("expected the successful agent turn to be in output, got %q", result.Output)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// fakeHermesACPPoisonedHistoryScript mimics a hermes-style adapter that emits
+// the "assistant message must not be empty" error in the Python [ERROR] log
+// format when asked to resume a session whose history is corrupted. This uses
+// the hermes-native stderr format (emoji-prefixed, after-N-retries), NOT the
+// bare kimi provider.api_error format — the kimi patterns are scoped to kimi.
+func fakeHermesACPPoisonedHistoryScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_poison"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' "2026-01-01 00:00:01 [ERROR] root: ❌ API call failed after 3 retries: BadRequestError the message at position 43 with role 'assistant' must not be empty" >&2
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// TestHermesBackendPoisonedHistorySetsResumeRejected verifies the fix
+// for the kimi "assistant message must not be empty" scenario: when
+// the sniffer detects a 400 with the poisoned-history signal the
+// backend must set ResumeRejected=true so the daemon drops the broken
+// session and tries fresh (via the tools==0 gate) instead of
+// resuming the same corrupt history on every subsequent task.
+func TestHermesBackendPoisonedHistorySetsResumeRejected(t *testing.T) {
+	t.Parallel()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPPoisonedHistoryScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout:         5 * time.Second,
+		ResumeSessionID: "ses_poison",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed for poisoned history, got %q", result.Status)
+		}
+		if !result.ResumeRejected {
+			t.Error("expected ResumeRejected=true so the daemon clears the broken session")
+		}
+		if !strings.Contains(result.Error, "must not be empty") {
+			t.Errorf("expected error to mention the poisoned history detail, got %q", result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+// ── extractACPMcpCapabilities ──
+
+func TestExtractACPMcpCapabilities(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		raw      string
+		want     acpMcpCapabilityDeclaration
+		wantHTTP bool
+		wantSSE  bool
+	}{
+		{
+			name:     "both true",
+			raw:      `{"protocolVersion":1,"agentCapabilities":{"mcpCapabilities":{"http":true,"sse":true}}}`,
+			want:     acpMcpCapabilitiesDeclared,
+			wantHTTP: true,
+			wantSSE:  true,
+		},
+		{
+			name:     "http only",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":{"http":true}}}`,
+			want:     acpMcpCapabilitiesDeclared,
+			wantHTTP: true,
+			wantSSE:  false,
+		},
+		{
+			name:     "sse only",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":{"sse":true}}}`,
+			want:     acpMcpCapabilitiesDeclared,
+			wantHTTP: false,
+			wantSSE:  true,
+		},
+		{
+			name:     "block present but both false",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":{"http":false,"sse":false}}}`,
+			want:     acpMcpCapabilitiesDeclared,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "empty block counts as declared",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":{}}}`,
+			want:     acpMcpCapabilitiesDeclared,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			// hermes 0.18.2's real initialize response: no block at all.
+			name:     "block omitted",
+			raw:      `{"agentCapabilities":{}}`,
+			want:     acpMcpCapabilitiesOmitted,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "agentCapabilities missing",
+			raw:      `{"protocolVersion":1}`,
+			want:     acpMcpCapabilitiesOmitted,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			// An explicit null is not silence and must not reach the
+			// omitted-capabilities exception.
+			name:     "explicit null block",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":null}}`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			// encoding/json decodes `null` into a non-pointer destination
+			// without touching it and without erroring, so these two used to
+			// be indistinguishable from a genuinely silent response and took
+			// the exception. ACP's InitializeResponse is an object and
+			// agentCapabilities is not nullable — both are malformed.
+			name:     "whole result is null",
+			raw:      `null`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "agentCapabilities is null",
+			raw:      `{"protocolVersion":1,"agentCapabilities":null}`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "agentCapabilities is not an object",
+			raw:      `{"agentCapabilities":[]}`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "whole result is an array",
+			raw:      `[]`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			// Unusable blocks must land in Invalid, not Omitted: Omitted is
+			// the one state the compatibility exception accepts, and a
+			// response we could not read is not evidence of silence.
+			name:     "block with wrong field types",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":{"http":"yes"}}}`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "block is not an object",
+			raw:      `{"agentCapabilities":{"mcpCapabilities":"http"}}`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+		{
+			name:     "malformed json",
+			raw:      `not json`,
+			want:     acpMcpCapabilitiesInvalid,
+			wantHTTP: false,
+			wantSSE:  false,
+		},
+	}
+	for _, tc := range tests {
+		got := extractACPMcpCapabilities(json.RawMessage(tc.raw))
+		if got.Declaration != tc.want || got.HTTP != tc.wantHTTP || got.SSE != tc.wantSSE {
+			t.Errorf("%s: got {Declaration:%v HTTP:%v SSE:%v}, want {Declaration:%v HTTP:%v SSE:%v}",
+				tc.name, got.Declaration, got.HTTP, got.SSE, tc.want, tc.wantHTTP, tc.wantSSE)
+		}
+	}
+}
+
+// ── filterACPMcpServersByCapability ──
+
+func TestFilterACPMcpServersByCapabilityStdioAlwaysPassesThrough(t *testing.T) {
+	t.Parallel()
+	// Stdio entries have no `type` field — the ACP spec doesn't gate stdio,
+	// so the filter must pass them through regardless of capabilities.
+	servers := []any{
+		map[string]any{"name": "fetch", "command": "uvx"},
+	}
+	got := filterACPMcpServersByCapability(servers, acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesDeclared}, "hermes", builtinACPConfig())
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+}
+
+func mixedTransportACPServers() []any {
+	return []any{
+		map[string]any{"name": "stdio", "command": "uvx"},
+		map[string]any{"type": "http", "name": "http", "url": "https://x/mcp"},
+		map[string]any{"type": "sse", "name": "sse", "url": "https://x/sse"},
+	}
+}
+
+// builtinACPConfig is the launch shape of a provider's own discovered
+// binary — the only one the omitted-capabilities exception may apply to.
+func builtinACPConfig() Config {
+	return Config{Logger: slog.Default(), BuiltinRuntime: true}
+}
+
+// customProfileACPConfig is a custom runtime profile: the protocol family
+// still arrives as the provider name, but the binary is someone else's.
+func customProfileACPConfig() Config {
+	return Config{Logger: slog.Default(), BuiltinRuntime: false}
+}
+
+func assertOnlyStdioSurvives(t *testing.T, label string, got []any) {
+	t.Helper()
+	if len(got) != 1 {
+		t.Errorf("%s: len got %d, want 1 (only stdio survives)", label, len(got))
+		return
+	}
+	if got[0].(map[string]any)["name"] != "stdio" {
+		t.Errorf("%s: kept wrong entry: %v", label, got[0])
+	}
+}
+
+// TestFilterACPMcpServersByCapabilityOmittedForwardsOnListedRuntime pins the
+// #6540 exception: hermes 0.18.2 declares no mcpCapabilities yet accepts both
+// remote transports, so applying the ACP default there silently discarded
+// every remote server its users configured.
+func TestFilterACPMcpServersByCapabilityOmittedForwardsOnListedRuntime(t *testing.T) {
+	t.Parallel()
+	caps := acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesOmitted}
+	got := filterACPMcpServersByCapability(mixedTransportACPServers(), caps, "hermes", builtinACPConfig())
+	if len(got) != 3 {
+		t.Fatalf("len: got %d, want 3 (built-in hermes is a verified exception)", len(got))
+	}
+}
+
+// ...and the exception must stay scoped to runtimes with real evidence.
+// Everything else keeps the ACP v1 default, where an omitted capability is
+// UNSUPPORTED — forwarding there could turn a missing tool into a failed
+// session on an implementation nobody has tested.
+func TestFilterACPMcpServersByCapabilityOmittedStillDropsOnUnlistedRuntimes(t *testing.T) {
+	t.Parallel()
+	caps := acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesOmitted}
+	for _, backend := range []string{"kimi", "kiro", "grok", "qoder", "reasonix", "traecli", "qwenpaw", "mcode"} {
+		assertOnlyStdioSurvives(t, backend,
+			filterACPMcpServersByCapability(mixedTransportACPServers(), caps, backend, builtinACPConfig()))
+	}
+}
+
+// TestFilterACPMcpServersByCapabilityOmittedStillDropsOnCustomProfile pins
+// the scope of the exception to the vendor's own binary. A custom runtime
+// profile keeps its protocol family as the provider, so `protocol_family:
+// hermes` with `command_name: jcode` reaches this filter as "hermes" while
+// being an implementation nobody verified — it must not inherit hermes'
+// compatibility exception.
+func TestFilterACPMcpServersByCapabilityOmittedStillDropsOnCustomProfile(t *testing.T) {
+	t.Parallel()
+	caps := acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesOmitted}
+	assertOnlyStdioSurvives(t, "custom profile on hermes family",
+		filterACPMcpServersByCapability(mixedTransportACPServers(), caps, "hermes", customProfileACPConfig()))
+}
+
+// TestFilterACPMcpServersByCapabilityInvalidNeverTakesTheException walks the
+// real path — extract, then filter — for every response shape that is
+// unreadable rather than silent. An unusable declaration is not evidence
+// that the runtime declared nothing, so none of these may reach the
+// exception even on a listed, built-in runtime.
+func TestFilterACPMcpServersByCapabilityInvalidNeverTakesTheException(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{
+		`{"agentCapabilities":{"mcpCapabilities":{"http":"yes"}}}`,
+		`{"agentCapabilities":{"mcpCapabilities":{"sse":1}}}`,
+		`{"agentCapabilities":{"mcpCapabilities":"http"}}`,
+		`{"agentCapabilities":{"mcpCapabilities":[]}}`,
+		`{"agentCapabilities":{"mcpCapabilities":null}}`,
+		// The null-decoding shapes: encoding/json accepts these silently,
+		// so only explicit per-level validation keeps them out of the
+		// exception.
+		`null`,
+		`{"protocolVersion":1,"agentCapabilities":null}`,
+		`{"agentCapabilities":[]}`,
+		`[]`,
+		`not json`,
+	} {
+		caps := extractACPMcpCapabilities(json.RawMessage(raw))
+		assertOnlyStdioSurvives(t, raw,
+			filterACPMcpServersByCapability(mixedTransportACPServers(), caps, "hermes", builtinACPConfig()))
+	}
+}
+
+// An explicit all-false block is a declaration, not silence, so even a
+// listed runtime honours it — the exception covers absence only.
+func TestFilterACPMcpServersByCapabilityExplicitOptOutStillDrops(t *testing.T) {
+	t.Parallel()
+	caps := acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesDeclared}
+	assertOnlyStdioSurvives(t, "explicit opt-out",
+		filterACPMcpServersByCapability(mixedTransportACPServers(), caps, "hermes", builtinACPConfig()))
+}
+
+func TestFilterACPMcpServersByCapabilityDropsUnsupportedHttp(t *testing.T) {
+	t.Parallel()
+	servers := []any{
+		map[string]any{"name": "stdio-ok", "command": "uvx"},
+		map[string]any{"type": "http", "name": "http-drop", "url": "https://x/mcp"},
+		map[string]any{"type": "sse", "name": "sse-keep", "url": "https://x/sse"},
+	}
+	got := filterACPMcpServersByCapability(servers, acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesDeclared, SSE: true}, "hermes", builtinACPConfig())
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want 2 (http should be dropped, sse kept)", len(got))
+	}
+	names := []string{got[0].(map[string]any)["name"].(string), got[1].(map[string]any)["name"].(string)}
+	wantNames := map[string]bool{"stdio-ok": true, "sse-keep": true}
+	for _, n := range names {
+		if !wantNames[n] {
+			t.Errorf("unexpected entry kept: %q", n)
+		}
+	}
+}
+
+func TestFilterACPMcpServersByCapabilityDropsUnsupportedSse(t *testing.T) {
+	t.Parallel()
+	servers := []any{
+		map[string]any{"type": "sse", "name": "sse-drop", "url": "https://x/sse"},
+		map[string]any{"type": "http", "name": "http-keep", "url": "https://x/mcp"},
+	}
+	got := filterACPMcpServersByCapability(servers, acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesDeclared, HTTP: true}, "kimi", builtinACPConfig())
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+	if got[0].(map[string]any)["name"] != "http-keep" {
+		t.Errorf("kept wrong entry: %v", got[0])
+	}
+}
+
+func TestFilterACPMcpServersByCapabilityKeepsAllWhenBothSupported(t *testing.T) {
+	t.Parallel()
+	servers := []any{
+		map[string]any{"name": "stdio", "command": "uvx"},
+		map[string]any{"type": "http", "name": "http", "url": "https://x/mcp"},
+		map[string]any{"type": "sse", "name": "sse", "url": "https://x/sse"},
+	}
+	got := filterACPMcpServersByCapability(servers, acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesDeclared, HTTP: true, SSE: true}, "kiro", builtinACPConfig())
+	if len(got) != 3 {
+		t.Fatalf("len: got %d, want 3", len(got))
+	}
+}
+
+func TestFilterACPMcpServersByCapabilityEmptyInputReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	got := filterACPMcpServersByCapability(nil, acpMcpTransportCapabilities{Declaration: acpMcpCapabilitiesDeclared, HTTP: true, SSE: true}, "hermes", builtinACPConfig())
+	if len(got) != 0 {
+		t.Errorf("len: got %d, want 0", len(got))
+	}
+}
+
+// TestHermesExecuteFailsClosedOnMalformedMcpConfig pins the contract that
+// a malformed mcp_config aborts the launch *before* the child is spawned.
+// Silently launching with no MCP servers would look indistinguishable
+// from "the saved config was applied" and is exactly the surprise the
+// MCP Tab is meant to remove.
+func TestHermesExecuteFailsClosedOnMalformedMcpConfig(t *testing.T) {
+	t.Parallel()
+
+	// Any existing executable is fine — Execute returns before the spawn.
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\nexit 0\n"))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = backend.Execute(ctx, "prompt", ExecOptions{
+		Timeout:   2 * time.Second,
+		McpConfig: json.RawMessage(`not json`),
+	})
+	if err == nil {
+		t.Fatal("expected Execute to fail closed on malformed mcp_config, got nil error")
+	}
+	if !strings.Contains(err.Error(), "mcp_config") {
+		t.Fatalf("expected error to mention mcp_config, got %q", err)
+	}
+}
+
+// fakeACPRecordingScript impersonates an ACP agent that records every
+// JSON-RPC frame it receives to a file (one per line) before responding.
+// The runtime name parameter lets the same script drive Hermes / Kimi /
+// Kiro fakes — only the session/load vs session/resume method differs.
+//
+// `caps` is the JSON for `agentCapabilities` returned from initialize so
+// tests can pin the capability gate (e.g. `{"mcpCapabilities":{"http":false}}`).
+//
+// session/new / session/resume both echo back the requested sessionId so
+// tests don't need to thread one through; session/prompt returns
+// end_turn so Execute completes cleanly.
+func fakeACPRecordingScript(recordPath, sessionID, caps string) string {
+	return `#!/bin/sh
+RECORD_PATH=` + recordPath + `
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$RECORD_PATH"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":` + caps + `}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*|*'"method":"session/resume"'*|*'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"` + sessionID + `"}}\n' "$id"
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// fakeACPRecordingScriptWithCurrentModel is like fakeACPRecordingScript but
+// makes session/new and session/resume advertise a `models.currentModelId`,
+// so tests can drive the "session is already on this model" branch of the
+// set_model gate.
+func fakeACPRecordingScriptWithCurrentModel(recordPath, sessionID, currentModelID string) string {
+	return `#!/bin/sh
+RECORD_PATH=` + recordPath + `
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$RECORD_PATH"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*|*'"method":"session/resume"'*|*'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"` + sessionID + `","models":{"currentModelId":"` + currentModelID + `"}}}\n' "$id"
+      ;;
+    *'"method":"session/set_model"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+// assertNoRecordedFrame fails if any recorded JSON-RPC frame used the given
+// method. The mirror of findRecordedFrame, for asserting a call was skipped.
+func assertNoRecordedFrame(t *testing.T, recordPath, method string) {
+	t.Helper()
+	data, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("read record file: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			continue
+		}
+		if frame["method"] == method {
+			t.Fatalf("unexpected recorded frame for method %q in %s", method, string(data))
+		}
+	}
+}
+
+// findRecordedFrame returns the first recorded JSON-RPC frame whose
+// `method` matches the requested one. Used by the resume / capability
+// tests below to inspect what we actually sent on the wire.
+func findRecordedFrame(t *testing.T, recordPath, method string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("read record file: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			continue
+		}
+		if frame["method"] == method {
+			return frame
+		}
+	}
+	t.Fatalf("no recorded frame for method %q in %s", method, string(data))
+	return nil
+}
+
+func TestHermesSetModelPreservesCustomModelIDWithColon(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "ses_new", `{}`)))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "custom:lfm2.5:8b",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/set_model")
+	params, ok := frame["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/set_model params: got %T, want map", frame["params"])
+	}
+	if params["sessionId"] != "ses_new" {
+		t.Errorf("session/set_model.sessionId = %v, want ses_new", params["sessionId"])
+	}
+	if params["modelId"] != "custom:lfm2.5:8b" {
+		t.Errorf("session/set_model.modelId must be passed verbatim, got %v", params["modelId"])
+	}
+}
+
+// TestHermesSkipsRedundantSetModelWhenAlreadyCurrent pins the MUL-5029 fix:
+// when session/new already reports the requested model as current, we must
+// NOT replay session/set_model. Hermes' set_model re-runs provider
+// auto-detection and can mis-route a `provider:model` id (e.g.
+// custom:deepseek-v4-pro) to OpenRouter, failing with an auth error on the
+// first turn. Re-selecting the model the session is already on is pure
+// downside, so the call is skipped.
+func TestHermesSkipsRedundantSetModelWhenAlreadyCurrent(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScriptWithCurrentModel(recordPath, "ses_new", "custom:deepseek-v4-pro")))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "custom:deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	assertNoRecordedFrame(t, recordPath, "session/set_model")
+}
+
+// TestHermesSendsSetModelWhenModelDiffersFromCurrent is the counterpart to the
+// skip test: when the requested model differs from the session's current one,
+// the explicit switch must still be sent verbatim.
+func TestHermesSendsSetModelWhenModelDiffersFromCurrent(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScriptWithCurrentModel(recordPath, "ses_new", "custom:some-default-model")))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "custom:deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/set_model")
+	params, ok := frame["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/set_model params: got %T, want map", frame["params"])
+	}
+	if params["modelId"] != "custom:deepseek-v4-pro" {
+		t.Errorf("session/set_model.modelId = %v, want custom:deepseek-v4-pro", params["modelId"])
+	}
+}
+
+// TestHermesSkipsRedundantSetModelForBareConfiguredModel pins the defect this
+// change exists for, at the level it actually lives at. agent.model is stored
+// bare (the spelling the CLI documents) while the session reports the
+// provider-encoded form, so the raw == in the MUL-5029 gate missed and
+// set_model went out every turn. Asserting on acpModelIDsEquivalent alone
+// would not have caught that the gate never fired.
+func TestHermesSkipsRedundantSetModelForBareConfiguredModel(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScriptWithCurrentModel(recordPath, "ses_new", "custom:deepseek-v4-pro")))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	assertNoRecordedFrame(t, recordPath, "session/set_model")
+}
+
+// TestHermesSendsSetModelWhenExplicitProviderAndBareCurrent guards the
+// asymmetry of the equivalence rules. A caller that names a provider
+// explicitly must get the switch even when the runtime reports a bare current
+// id, because a bare id cannot confirm which provider is actually in use.
+// Runtimes really do answer this way — acp_effort_test.go captures an
+// unprefixed `gpt-5.6-sol` from jcode, which routes through this backend.
+func TestHermesSendsSetModelWhenExplicitProviderAndBareCurrent(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScriptWithCurrentModel(recordPath, "ses_new", "hermes-4")))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 5 * time.Second,
+		Model:   "openrouter:hermes-4",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case result := <-session.Result:
+		if result.Status != "completed" {
+			t.Fatalf("expected completed result, got %q: %s", result.Status, result.Error)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/set_model")
+	params, ok := frame["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/set_model params: got %T, want map", frame["params"])
+	}
+	if params["modelId"] != "openrouter:hermes-4" {
+		t.Errorf("session/set_model.modelId = %v, want openrouter:hermes-4", params["modelId"])
+	}
+}
+
+// TestHermesResumeIncludesMcpServers pins the contract that
+// session/resume carries the managed MCP set. Without this, a resumed
+// Hermes task lost access to MCP tools that a fresh task on the same
+// agent would have — which is the inconsistency Elon's review flagged.
+func TestHermesResumeIncludesMcpServers(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "ses_resume", `{}`)))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout:         30 * time.Second,
+		ResumeSessionID: "ses_resume",
+		McpConfig:       json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case <-session.Result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/resume")
+	params, ok := frame["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("session/resume params: got %T, want map", frame["params"])
+	}
+	servers, ok := params["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("session/resume.mcpServers: got %T, want []any", params["mcpServers"])
+	}
+	if len(servers) != 1 {
+		t.Fatalf("session/resume.mcpServers: got %d entries, want 1", len(servers))
+	}
+	entry := servers[0].(map[string]any)
+	if entry["name"] != "fetch" || entry["command"] != "uvx" {
+		t.Errorf("session/resume.mcpServers[0]: got %v, want {name:fetch,command:uvx,...}", entry)
+	}
+}
+
+// TestHermesForwardsRemoteMcpUnderOmittedCapabilitiesException pins the
+// #6540 fix end to end. Real hermes 0.18.2 responds exactly like this fake —
+// no mcpCapabilities block — while accepting both remote transports, so it
+// is on the verified exception list and its users' http/sse servers must
+// reach session/new instead of vanishing into a daemon log. Runtimes off
+// that list keep the ACP v1 default; see the qoder counterpart.
+func TestHermesForwardsRemoteMcpUnderOmittedCapabilitiesException(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	// agentCapabilities = {} → no mcpCapabilities block at all.
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "ses_new", `{}`)))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default(), BuiltinRuntime: true})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 30 * time.Second,
+		McpConfig: json.RawMessage(`{"mcpServers":{
+			"local":{"command":"uvx"},
+			"remote-http":{"type":"http","url":"https://x/mcp"},
+			"remote-sse":{"type":"sse","url":"https://x/sse"}
+		}}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case <-session.Result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/new")
+	params := frame["params"].(map[string]any)
+	servers, ok := params["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("session/new.mcpServers: got %T, want []any", params["mcpServers"])
+	}
+	if len(servers) != 3 {
+		t.Fatalf("session/new.mcpServers: got %d entries, want 3 (nothing declared means nothing declined)", len(servers))
+	}
+}
+
+// TestHermesCustomProfileDropsRemoteMcpWhenCapabilityOmitted is the same
+// runtime family and the same silent initialize response, launched the way
+// the daemon launches a custom runtime profile. jcode reaches this backend
+// as "hermes" while being a binary nobody verified, so it must get the ACP
+// v1 default rather than hermes' compatibility exception.
+func TestHermesCustomProfileDropsRemoteMcpWhenCapabilityOmitted(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "jcode")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "ses_new", `{}`)))
+
+	// BuiltinRuntime stays false: this is a custom profile's command, not
+	// the hermes binary the exception was verified against.
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 30 * time.Second,
+		McpConfig: json.RawMessage(`{"mcpServers":{
+			"local":{"command":"uvx"},
+			"remote-http":{"type":"http","url":"https://x/mcp"},
+			"remote-sse":{"type":"sse","url":"https://x/sse"}
+		}}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case <-session.Result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/new")
+	params := frame["params"].(map[string]any)
+	servers, ok := params["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("session/new.mcpServers: got %T, want []any", params["mcpServers"])
+	}
+	if len(servers) != 1 {
+		t.Fatalf("session/new.mcpServers: got %d entries, want 1 (a custom profile does not inherit the exception)", len(servers))
+	}
+	if servers[0].(map[string]any)["name"] != "local" {
+		t.Errorf("kept the wrong entry: %v", servers[0])
+	}
+}
+
+// TestHermesDropsRemoteMcpWhenCapabilityExplicitlyDeclined pins the other
+// half of the contract: an mcpCapabilities block that is present and says
+// false IS a declaration, and sending those entries anyway is the protocol
+// violation the filter exists to prevent.
+func TestHermesDropsRemoteMcpWhenCapabilityExplicitlyDeclined(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "ses_new", `{"mcpCapabilities":{"http":false,"sse":false}}`)))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 30 * time.Second,
+		McpConfig: json.RawMessage(`{"mcpServers":{
+			"local":{"command":"uvx"},
+			"remote-http":{"type":"http","url":"https://x/mcp"},
+			"remote-sse":{"type":"sse","url":"https://x/sse"}
+		}}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case <-session.Result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/new")
+	params := frame["params"].(map[string]any)
+	servers, ok := params["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("session/new.mcpServers: got %T, want []any", params["mcpServers"])
+	}
+	if len(servers) != 1 {
+		t.Fatalf("session/new.mcpServers: got %d entries, want 1 (only stdio survives an explicit opt-out)", len(servers))
+	}
+	if servers[0].(map[string]any)["name"] != "local" {
+		t.Errorf("kept the wrong entry: %v", servers[0])
+	}
+}
+
+// TestHermesKeepsRemoteMcpWhenCapabilityAdvertised confirms the gate
+// doesn't over-filter: when the runtime advertises http+sse, all entries
+// must pass through to session/new.
+func TestHermesKeepsRemoteMcpWhenCapabilityAdvertised(t *testing.T) {
+	t.Parallel()
+
+	recordPath := filepath.Join(t.TempDir(), "frames.jsonl")
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeACPRecordingScript(recordPath, "ses_new", `{"mcpCapabilities":{"http":true,"sse":true}}`)))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "prompt-ignored", ExecOptions{
+		Timeout: 30 * time.Second,
+		McpConfig: json.RawMessage(`{"mcpServers":{
+			"local":{"command":"uvx"},
+			"remote-http":{"type":"http","url":"https://x/mcp"},
+			"remote-sse":{"type":"sse","url":"https://x/sse"}
+		}}`),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	select {
+	case <-session.Result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+
+	frame := findRecordedFrame(t, recordPath, "session/new")
+	params := frame["params"].(map[string]any)
+	servers := params["mcpServers"].([]any)
+	if len(servers) != 3 {
+		t.Fatalf("session/new.mcpServers: got %d entries, want 3", len(servers))
+	}
+}
+
+// TestParseHermesProfileArgs covers the parser's fidelity to Hermes'
+// _apply_profile_override step 1/1b: first occurrence, both spellings, the inline
+// empty value, the space-form profile-id guard, value-flag skipping, and the
+// `--` / `mcp add --args` boundaries.
+func TestParseHermesProfileArgs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		args     []string
+		wantName string
+		found    bool
+		inline   bool
+		from     int
+		length   int
+	}{
+		{"none", []string{"--yolo"}, "", false, false, -1, 0},
+		{"short flag", []string{"-p", "research"}, "research", true, false, 0, 2},
+		{"long flag", []string{"--profile", "research"}, "research", true, false, 0, 2},
+		{"inline", []string{"--profile=research"}, "research", true, true, 0, 1},
+		{"inline empty value", []string{"--profile="}, "", true, true, 0, 1},
+		{"trailing short flag with no value", []string{"--yolo", "-p"}, "", false, false, -1, 0},
+		{"amid other args", []string{"--yolo", "--profile", "coder", "-x"}, "coder", true, false, 1, 2},
+		{"space-form invalid value ignored", []string{"-p", "no:xdist"}, "", false, false, -1, 0},
+		{"value-flag hides a following -p", []string{"-m", "-p", "research"}, "", false, false, -1, 0},
+		{"double-dash sentinel stops scan", []string{"--", "-p", "research"}, "", false, false, -1, 0},
+		{"mcp add --args passthrough stops scan", []string{"mcp", "add", "srv", "--args", "-p", "research"}, "", false, false, -1, 0},
+		{"only the first occurrence is selected", []string{"-p", "research", "--profile", "coder"}, "research", true, false, 0, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sel := ParseHermesProfileArgs(tc.args)
+			if sel.Name != tc.wantName || sel.Found != tc.found || sel.Inline != tc.inline ||
+				sel.ArgFrom != tc.from || sel.ArgLen != tc.length {
+				t.Errorf("ParseHermesProfileArgs(%v) = %+v, want name=%q found=%v inline=%v from=%d len=%d",
+					tc.args, sel, tc.wantName, tc.found, tc.inline, tc.from, tc.length)
+			}
+		})
+	}
+}
+
+// TestStripHermesProfileArgs asserts only the parsed occurrence is removed (not
+// every -p/--profile spelling), and that the base blocked set does NOT strip the
+// profile flags, so a skill-less task's profile passes through unchanged.
+func TestStripHermesProfileArgs(t *testing.T) {
+	t.Parallel()
+	args := []string{"-p", "research", "--yolo", "--profile", "coder"}
+	sel := ParseHermesProfileArgs(args)
+	got := StripHermesProfileArgs(args, sel)
+	want := []string{"--yolo", "--profile", "coder"}
+	if len(got) != len(want) {
+		t.Fatalf("StripHermesProfileArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("StripHermesProfileArgs = %v, want %v", got, want)
+		}
+	}
+	if none := StripHermesProfileArgs([]string{"--yolo"}, ParseHermesProfileArgs([]string{"--yolo"})); len(none) != 1 || none[0] != "--yolo" {
+		t.Fatalf("no selection should leave args unchanged, got %v", none)
+	}
+	if _, ok := hermesBlockedArgs["-p"]; ok {
+		t.Error("hermesBlockedArgs must not unconditionally strip -p")
+	}
+	if _, ok := hermesBlockedArgs["--profile"]; ok {
+		t.Error("hermesBlockedArgs must not unconditionally strip --profile")
+	}
+}
+
+// TestACPRawText covers the rawOutput/output shape tolerance added for the
+// GPT-5.6 Sol path (#5509): a string is returned verbatim, an object/array is
+// preserved as raw JSON text, and empty input yields "".
+func TestACPRawText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"empty", ``, ""},
+		{"json null", `null`, ""},
+		{"plain string", `"created comment"`, "created comment"},
+		{"object (gpt-5.6-sol shape)", `{"items":[{"Json":{"stdout":"ok\n"}}]}`, `{"items":[{"Json":{"stdout":"ok\n"}}]}`},
+		{"array", `["a","b"]`, `["a","b"]`},
+	}
+	for _, tt := range tests {
+		got := acpRawText(json.RawMessage(tt.raw))
+		if got != tt.want {
+			t.Errorf("%s: acpRawText(%q) = %q, want %q", tt.name, tt.raw, got, tt.want)
+		}
+	}
+}
+
+// TestHermesResumeSessionLost pins the predicate behind the GH #6150 recovery.
+// Both conditions are load-bearing: a refusal after real agent activity is a
+// model refusal, and a refusal on a fresh session says nothing about resume.
+func TestHermesResumeSessionLost(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		resumeID   string
+		stopReason string
+		activity   int64
+		want       bool
+	}{
+		{name: "resumed refusal with no activity", resumeID: "ses_dead", stopReason: "refusal", want: true},
+		{name: "resumed refusal after activity", resumeID: "ses_dead", stopReason: "refusal", activity: 3},
+		{name: "fresh session refusal", stopReason: "refusal"},
+		{name: "resumed end_turn", resumeID: "ses_ok", stopReason: "end_turn"},
+		{name: "resumed cancelled", resumeID: "ses_ok", stopReason: "cancelled"},
+		{name: "resumed empty stop reason", resumeID: "ses_ok"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := hermesResumeSessionLost(tc.resumeID, tc.stopReason, tc.activity); got != tc.want {
+				t.Errorf("hermesResumeSessionLost(%q, %q, %d) = %v, want %v",
+					tc.resumeID, tc.stopReason, tc.activity, got, tc.want)
+			}
+		})
+	}
+}
+
+// fakeHermesACPRefusedResumeScript reproduces what real Hermes does with a
+// session it cannot load, verified against upstream hermes-agent main by
+// driving `hermes acp` over stdio:
+//
+//	session/resume -> success, result carries only _meta/models/modes
+//	                  (ACP ResumeSessionResponse has no sessionId field)
+//	session/prompt -> success, {"stopReason":"refusal"}, no session/update at all
+//
+// Nothing in the exchange is a JSON-RPC error, which is why isACPSessionNotFound
+// cannot see it. Env switches:
+//
+//	ACP_PROVIDER_ERR=1 — also write the stderr Hermes emits when the session's
+//	                     persisted provider identity no longer resolves (#6150).
+//	ACP_ACTIVITY=1     — stream one agent_message_chunk before refusing, the
+//	                     legitimate-refusal control case.
+//	ACP_LATE_ACTIVITY=1 — send that chunk AFTER the refusal and after the
+//	                     notification quiet window has elapsed, i.e. in the gap
+//	                     between quiescence and stdin EOF that Hermes really
+//	                     uses for a turn's final message.
+func fakeHermesACPRefusedResumeScript() string {
+	return `#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"ses_fresh"}}\n' "$id"
+      ;;
+    *'"method":"session/resume"'*)
+      if [ "$ACP_PROVIDER_ERR" = "1" ]; then
+        echo '2026-07-30 13:46:51 [WARNING] acp_adapter.session: Failed to recreate agent for ACP session ses_dead' >&2
+        echo 'RuntimeError: No LLM provider configured. Run hermes model to select a provider.' >&2
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"_meta":{},"models":null,"modes":null}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      if [ "$ACP_ACTIVITY" = "1" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I will not do that."}}}}\n' "$sid"
+      fi
+      if [ "$ACP_PROVIDER_ERR" = "1" ]; then
+        echo '2026-07-30 13:46:51 [ERROR] acp_adapter.server: prompt: session ses_dead not found' >&2
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"refusal"}}\n' "$id"
+      if [ "$ACP_LATE_ACTIVITY" = "1" ]; then
+        sleep 0.6
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Sorry, I will not do that."}}}}\n' "$sid"
+      fi
+      exit 0
+      ;;
+  esac
+done
+`
+}
+
+func runHermesRefusedResume(t *testing.T, opts ExecOptions, env map[string]string) Result {
+	t.Helper()
+
+	fakePath := filepath.Join(t.TempDir(), "hermes")
+	writeTestExecutable(t, fakePath, []byte(fakeHermesACPRefusedResumeScript()))
+
+	backend, err := New("hermes", Config{ExecutablePath: fakePath, Logger: slog.Default(), Env: env})
+	if err != nil {
+		t.Fatalf("new hermes backend: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if opts.Timeout == 0 {
+		opts.Timeout = 20 * time.Second
+	}
+	session, err := backend.Execute(ctx, "continue", opts)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		return result
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+	return Result{}
+}
+
+// TestHermesBackendRecoversFromRefusedResume is the GH #6150 regression. A
+// resumed session Hermes cannot rebuild must fail loudly AND surrender the dead
+// session id, so shouldRetryWithFreshSession fires once and the id is retired.
+// Before the fix this reported status=completed with empty output while handing
+// the dead id straight back, so every later comment / approval / @mention on the
+// issue re-resumed it and the agent was usable exactly once per issue.
+func TestHermesBackendRecoversFromRefusedResume(t *testing.T) {
+	t.Parallel()
+
+	result := runHermesRefusedResume(t, ExecOptions{ResumeSessionID: "ses_dead"}, nil)
+
+	if result.Status != "failed" {
+		t.Errorf("status = %q, want failed (a turn that ran nothing must not report success)", result.Status)
+	}
+	if result.Error != hermesResumeLostError {
+		t.Errorf("error = %q, want %q", result.Error, hermesResumeLostError)
+	}
+	if result.SessionID != "" {
+		t.Errorf("session id = %q, want empty so the daemon retries fresh", result.SessionID)
+	}
+	if !result.ResumeRejected {
+		t.Error("ResumeRejected = false, want true so shouldRetryWithFreshSession fires")
+	}
+}
+
+// TestHermesBackendKeepsProviderErrorOnRefusedResume pins the ordering against
+// the provider-error promotion: when the sniffer captured WHY Hermes could not
+// rebuild the session, that reason is what the user needs to see, so the generic
+// fallback must not overwrite it. The recovery signals still apply.
+func TestHermesBackendKeepsProviderErrorOnRefusedResume(t *testing.T) {
+	t.Parallel()
+
+	result := runHermesRefusedResume(t,
+		ExecOptions{ResumeSessionID: "ses_dead"},
+		map[string]string{"ACP_PROVIDER_ERR": "1"},
+	)
+
+	if result.Status != "failed" {
+		t.Errorf("status = %q, want failed", result.Status)
+	}
+	if !strings.Contains(result.Error, "No LLM provider configured") {
+		t.Errorf("error = %q, want the captured provider error rather than the generic fallback", result.Error)
+	}
+	if result.SessionID != "" {
+		t.Errorf("session id = %q, want empty so the daemon retries fresh", result.SessionID)
+	}
+	if !result.ResumeRejected {
+		t.Error("ResumeRejected = false, want true so shouldRetryWithFreshSession fires")
+	}
+}
+
+// TestHermesBackendKeepsSessionOnRefusalAfterActivity is the false-positive
+// guard. A resumed turn that streamed real agent output and then stopped on
+// refusal is a model refusal, not a lost session: dropping the session id there
+// would discard a healthy conversation pointer and re-run the turn.
+func TestHermesBackendKeepsSessionOnRefusalAfterActivity(t *testing.T) {
+	t.Parallel()
+
+	result := runHermesRefusedResume(t,
+		ExecOptions{ResumeSessionID: "ses_dead"},
+		map[string]string{"ACP_ACTIVITY": "1"},
+	)
+
+	if result.SessionID != "ses_dead" {
+		t.Errorf("session id = %q, want the resumed id preserved", result.SessionID)
+	}
+	if result.ResumeRejected {
+		t.Error("ResumeRejected = true, want false — the agent ran, so a fresh session is not the cure")
+	}
+}
+
+// TestHermesBackendKeepsSessionOnRefusalWithLateActivity is the timing
+// false-positive guard. The notification quiet window closing does not end the
+// turn — stdin EOF and the pipe drain do, and Hermes legitimately delivers a
+// turn's final chunk in that gap (see
+// TestHermesBackendDrainsLateFinalNotificationAfterPromptResponse). Deciding
+// "no activity" at the quiescence boundary instead of after the drain would
+// discard this healthy session and re-run the turn.
+func TestHermesBackendKeepsSessionOnRefusalWithLateActivity(t *testing.T) {
+	t.Parallel()
+
+	result := runHermesRefusedResume(t,
+		ExecOptions{ResumeSessionID: "ses_dead"},
+		map[string]string{"ACP_LATE_ACTIVITY": "1"},
+	)
+
+	if result.Output == "" {
+		t.Fatal("late chunk never reached the result; the fixture is not exercising the drain gap")
+	}
+	if result.SessionID != "ses_dead" {
+		t.Errorf("session id = %q, want the resumed id preserved", result.SessionID)
+	}
+	if result.ResumeRejected {
+		t.Error("ResumeRejected = true, want false — the agent answered, only late")
+	}
+}
+
+// TestHermesBackendIgnoresRefusalOnFreshSession is the second false-positive
+// guard: with no session to resume there is nothing to declare lost, so the
+// fresh session id must survive.
+func TestHermesBackendIgnoresRefusalOnFreshSession(t *testing.T) {
+	t.Parallel()
+
+	result := runHermesRefusedResume(t, ExecOptions{}, nil)
+
+	if result.SessionID != "ses_fresh" {
+		t.Errorf("session id = %q, want ses_fresh", result.SessionID)
+	}
+	if result.ResumeRejected {
+		t.Error("ResumeRejected = true, want false on a fresh session")
+	}
+}
+
+// TestHermesClientEmitsToolUseWhenStartFrameCarriesCommand pins GH#6583.
+//
+// The tool_call line is a verbatim capture from `hermes acp` (Hermes Agent
+// v0.20.0) driven with this client's own handshake: it carries the full
+// invocation in `content` but no rawInput. Before the fix that combination hit
+// the kimi deferral path, so nothing was emitted until the call completed —
+// an in-flight Hermes tool was invisible in run-messages, and the daemon's
+// in-flight tool counter (which only advances on MessageToolUse) never saw it.
+func TestHermesClientEmitsToolUseWhenStartFrameCarriesCommand(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:                    make(map[int]*pendingRPC),
+		toolStartCarriesFinalInput: true,
+		onMessage:                  func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"$ multica issue get 7473e16c --output json","type":"text"},"type":"content"}],"kind":"execute","locations":[],"title":"terminal: multica issue get 7473e16c --output json","toolCallId":"tc-305462f5d67d","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 1 {
+		t.Fatalf("expected MessageToolUse on the start frame, got %d: %+v", len(got), got)
+	}
+	if got[0].Type != MessageToolUse {
+		t.Fatalf("type: got %v, want MessageToolUse", got[0].Type)
+	}
+	if got[0].Tool != "terminal" {
+		t.Errorf("tool: got %q, want %q", got[0].Tool, "terminal")
+	}
+	if got[0].CallID != "tc-305462f5d67d" {
+		t.Errorf("callID: got %q", got[0].CallID)
+	}
+	if text, _ := got[0].Input["text"].(string); text != "$ multica issue get 7473e16c --output json" {
+		t.Errorf("input.text: got %v", got[0].Input["text"])
+	}
+
+	// Completion must add only the result — never a second MessageToolUse.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"terminal result\n- **exit_code:** 0","type":"text"},"type":"content"}],"kind":"execute","status":"completed","toolCallId":"tc-305462f5d67d","sessionUpdate":"tool_call_update"}}}`)
+
+	if len(got) != 2 {
+		t.Fatalf("expected [ToolUse, ToolResult], got %d: %+v", len(got), got)
+	}
+	if got[1].Type != MessageToolResult {
+		t.Errorf("second message: got %v, want MessageToolResult", got[1].Type)
+	}
+	if got[1].Status != "completed" {
+		t.Errorf("result status: got %q", got[1].Status)
+	}
+}
+
+// TestHermesClientDefersToolUseForPartialStreamedArgs guards the kimi path the
+// fix above must not regress: a start frame carrying an unterminated JSON
+// fragment is still buffered, so the UI never sees a half-streamed command.
+func TestHermesClientDefersToolUseForPartialStreamedArgs(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-kimi","title":"Shell","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"{\"comm"}}]}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("expected partial args to stay deferred, got %+v", got)
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-kimi","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"{\"command\":\"echo hi\"}"}}]}}}`)
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-kimi","status":"completed","content":[{"type":"content","content":{"type":"text","text":"hi\n"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if cmd, _ := got[0].Input["command"].(string); cmd != "echo hi" {
+		t.Errorf("streamed args should be parsed at completion: got %v", got[0].Input)
+	}
+}
+
+func TestACPToolCallStartCarriesInvocation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		toolName string
+		argsText string
+		want     bool
+	}{
+		{"hermes terminal command", "terminal", "$ ls -la", true},
+		{"hermes terminal with leading space", "terminal", "  $ go build ./...", true},
+		{"terminal but not a command line", "terminal", "Running the command...", false},
+		{"write_file prose", "write_file", "Preparing write to /tmp/a.txt. Approval prompt shows the diff.", false},
+		{"patch prose", "patch", "Preparing replace edit for /tmp/a.txt. Approval prompt shows the diff.", false},
+		{"web_search summary", "web_search", "Searching the web for golang acp", false},
+		{"kimi streamed json", "Shell", `{"command":"echo hi"}`, false},
+		{"kimi partial json", "Shell", `{"comm`, false},
+		{"empty", "terminal", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := acpToolCallStartCarriesInvocation(tt.toolName, tt.argsText); got != tt.want {
+				t.Errorf("acpToolCallStartCarriesInvocation(%q, %q) = %v, want %v",
+					tt.toolName, tt.argsText, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHermesClientDoesNotFreezeDisplayTextAsInput is the protocol-level guard.
+//
+// ACP defines `content` as display output produced by the tool call and
+// `rawInput` as the input, and a later update may still supply the real
+// rawInput. Hermes itself does this: write_file's start frame renders
+// "Preparing write to <path>..." with no rawInput. That text must never be
+// recorded as the invocation, and a rawInput arriving later must win.
+func TestHermesClientDoesNotFreezeDisplayTextAsInput(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	// Start frame: display prose only, no rawInput (verbatim Hermes shape).
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"Preparing write to /tmp/hello.txt. Approval prompt shows the diff.","type":"text"},"type":"content"}],"kind":"edit","locations":[{"path":"/tmp/hello.txt"}],"title":"write: /tmp/hello.txt","toolCallId":"tc-w1","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("display-only start frame must not emit a tool use, got %+v", got)
+	}
+
+	// Completion carries the real input.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-w1","status":"completed","title":"write: /tmp/hello.txt","kind":"edit","rawInput":{"path":"/tmp/hello.txt","content":"hi"},"content":[{"type":"content","content":{"type":"text","text":"wrote 2 bytes"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if path, _ := got[0].Input["path"].(string); path != "/tmp/hello.txt" {
+		t.Errorf("real rawInput must win over display text; Input = %v", got[0].Input)
+	}
+	if text, ok := got[0].Input["text"].(string); ok && strings.Contains(text, "Preparing write") {
+		t.Errorf("display text was frozen as the invocation: %q", text)
+	}
+}
+
+// TestHermesClientDefersNonCommandStartContent: a start frame whose content is
+// not a `$ <command>` line stays deferred even when the text is complete and
+// non-JSON, so a backend that renders a status line cannot have it mistaken for
+// the invocation.
+func TestHermesClientDefersNonCommandStartContent(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"tc","title":"Shell","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"not-json"}}]}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("non-command start content must stay deferred, got %+v", got)
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc","status":"completed","content":[{"type":"content","content":{"type":"text","text":"output"}}]}}}`)
+
+	if len(got) != 2 || got[0].Type != MessageToolUse {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if text, _ := got[0].Input["text"].(string); text != "not-json" {
+		t.Errorf("deferred fallback Input.text: got %v", got[0].Input)
+	}
+}
+
+// TestHermesClientEmitsToolUseForPolishedToolWithoutInput covers the rest of
+// GH#6583's defect: Hermes omits rawInput for its whole polished tool set, so
+// write / patch / web / browser / execute_code calls were invisible while
+// running and never advanced the daemon's in-flight tool counter, leaving them
+// on the short idle budget instead of the tool budget.
+//
+// They must now surface at the start frame like terminal does — but with no
+// Input, because their content is a rendering ("Preparing write to <path>"),
+// not the call's arguments.
+func TestHermesClientEmitsToolUseForPolishedToolWithoutInput(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:                    make(map[int]*pendingRPC),
+		toolStartCarriesFinalInput: true,
+		onMessage:                  func(msg Message) { got = append(got, msg) },
+	}
+
+	// Verbatim Hermes write_file start frame: prose content, no rawInput.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"Preparing write to /tmp/hello.txt. Approval prompt shows the diff.","type":"text"},"type":"content"}],"kind":"edit","locations":[{"path":"/tmp/hello.txt"}],"title":"write: /tmp/hello.txt","toolCallId":"tc-w9","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 1 || got[0].Type != MessageToolUse {
+		t.Fatalf("expected MessageToolUse at the start frame, got %+v", got)
+	}
+	if got[0].Tool != "write_file" {
+		t.Errorf("tool: got %q, want %q", got[0].Tool, "write_file")
+	}
+	if got[0].CallID != "tc-w9" {
+		t.Errorf("callID: got %q", got[0].CallID)
+	}
+	if got[0].Input != nil {
+		t.Errorf("display prose must not be reported as input, got Input = %v", got[0].Input)
+	}
+
+	// Completion adds only the result — no second MessageToolUse.
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-w9","status":"completed","kind":"edit","content":[{"type":"content","content":{"type":"text","text":"wrote 2 bytes"}}]}}}`)
+
+	if len(got) != 2 || got[1].Type != MessageToolResult {
+		t.Fatalf("expected [ToolUse, ToolResult], got %+v", got)
+	}
+	if got[1].Output != "wrote 2 bytes" {
+		t.Errorf("result output: got %q", got[1].Output)
+	}
+}
+
+// TestHermesClientReadFileStartWithNoContentStillVisible: read_file sends a
+// start frame with no content at all. It must still register as an in-flight
+// tool so the run shows it and the daemon counts it.
+func TestHermesClientReadFileStartWithNoContentStillVisible(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:                    make(map[int]*pendingRPC),
+		toolStartCarriesFinalInput: true,
+		onMessage:                  func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"kind":"read","locations":[{"path":"/tmp/a.go"}],"title":"read: /tmp/a.go","toolCallId":"tc-r1","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 1 || got[0].Type != MessageToolUse || got[0].Tool != "read_file" {
+		t.Fatalf("expected a read_file MessageToolUse at start, got %+v", got)
+	}
+	if got[0].Input != nil {
+		t.Errorf("expected no fabricated input, got %v", got[0].Input)
+	}
+}
+
+// TestHermesClientOtherDialectsStillDefer: the flag is opt-in, so a backend
+// that has not set it (kimi, kiro, qoder, grok, mcode, qwenpaw, reasonix,
+// traecli) keeps the previous deferred behaviour even for a terminal-shaped
+// frame.
+func TestHermesClientOtherDialectsStillDefer(t *testing.T) {
+	t.Parallel()
+
+	var got []Message
+	c := &hermesClient{
+		pending:   make(map[int]*pendingRPC),
+		onMessage: func(msg Message) { got = append(got, msg) },
+	}
+
+	c.handleLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_1","update":{"content":[{"content":{"text":"$ ls -la","type":"text"},"type":"content"}],"kind":"execute","title":"terminal: ls -la","toolCallId":"tc-x","sessionUpdate":"tool_call"}}}`)
+
+	if len(got) != 0 {
+		t.Fatalf("dialects without toolStartCarriesFinalInput must still defer, got %+v", got)
+	}
+}

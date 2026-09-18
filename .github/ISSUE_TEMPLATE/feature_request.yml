@@ -1,0 +1,62 @@
+name: "Feature Request"
+description: Suggest a new feature or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment type
+      description: Are you using the Official App (multica.ai) or a self-hosted instance?
+      options:
+        - Official App
+        - self-host
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: >-
+        Which part of Multica is this about? Areas marked community-maintained are
+        looked after by volunteer maintainers — see
+        https://multica.ai/docs/community-maintained. Please do not @-mention a
+        maintainer directly; we route reports from here.
+      options:
+        - Web app
+        - Desktop app
+        - Mobile app (iOS)
+        - CLI
+        - Agents and runtimes
+        - Issues, projects and workspaces
+        - Chat integration — Feishu / Lark or Slack
+        - Chat integration — DingTalk (community-maintained)
+        - Chat integration — WeCom (community-maintained)
+        - Chat integration — Telegram (community-maintained)
+        - Self-hosting and deployment
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What do you want and why?
+      description: Describe the problem you're trying to solve or the improvement you'd like to see.
+      placeholder: |
+        I'm trying to do X but there's no way to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution (optional)
+      description: If you have an idea for how this should work, describe it here.
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots / mockups (optional)
+      description: If applicable, add screenshots, mockups, or sketches to illustrate your idea.

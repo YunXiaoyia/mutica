@@ -1,0 +1,46 @@
+# Dependencies
+node_modules
+.pnpm-store
+
+# Build outputs
+.next
+dist
+server/bin
+server/tmp
+
+# Git
+.git
+.gitignore
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+e2e/test-results
+coverage
+
+# Docs
+/docs/
+*.md
+
+# Only the web workspace is used by Dockerfile.web. Default-exclude future
+# app workspaces so they do not silently enter the build context.
+/apps/*
+!/apps/web/
+
+# Repository-only tooling
+/.github/
+/deploy/
+/scripts/

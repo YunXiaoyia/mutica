@@ -1,0 +1,162 @@
+---
+title: 登录与注册
+description: 配置邮箱验证码、Google 登录和新用户注册范围。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica 默认使用邮箱验证码登录，也可以增加 Google OAuth。已经存在的用户始终可以再次登录；注册限制只决定是否允许创建新账号。
+
+## 邮箱验证码
+
+用户输入邮箱后，Multica 会发送一个 6 位验证码。验证码 10 分钟内有效，验证成功后浏览器获得登录 cookie。
+
+邮件可以通过 Resend 或 SMTP 发送。两者同时配置时，`SMTP_HOST` 优先。
+
+### 使用 Resend
+
+1. 在 [Resend](https://resend.com/) 验证发信域名并创建 API key。
+2. 设置：
+
+ ```dotenv
+ RESEND_API_KEY=re_xxxxxxxxxxxxxxxx
+ RESEND_FROM_EMAIL=noreply@example.com
+ ```
+
+3. 重启 API 服务。
+
+`RESEND_FROM_EMAIL` 必须属于已经在 Resend 验证的域名。
+
+### 使用 SMTP
+
+最少需要设置主机和发件地址：
+
+```dotenv
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=multica
+SMTP_PASSWORD=<password>
+SMTP_FROM_EMAIL=noreply@example.com
+```
+
+常见连接方式：
+
+| 场景 | 配置 |
+|---|---|
+| 内网匿名 relay | `SMTP_PORT=25`，用户名和密码留空 |
+| STARTTLS | `SMTP_PORT=587`，默认会在服务器支持时升级 TLS |
+| 隐式 TLS | `SMTP_PORT=465`，或显式设置 `SMTP_TLS=implicit` |
+
+如果没有设置 `SMTP_FROM_EMAIL`，会回退到 `RESEND_FROM_EMAIL`。私有 CA 或自签证书需要把 CA 加入容器信任库；`SMTP_TLS_INSECURE=true` 会跳过证书校验，只应在可信内网中临时使用。
+
+有些严格的 relay 还要求合法的 EHLO 名称：
+
+```dotenv
+SMTP_EHLO_NAME=mail.example.com
+```
+
+### 无邮件服务时的行为
+
+服务器仍可启动，但验证码和邀请链接只会写入日志，不会发送邮件。这适合本地开发，不适合生产环境。
+
+启动日志会说明当前使用的是 `Resend API`、`SMTP relay` 还是 `DEV mode`。
+
+## 本地固定验证码
+
+本地自动化测试可以设置固定验证码：
+
+```dotenv
+APP_ENV=development
+MULTICA_DEV_VERIFICATION_CODE=888888
+```
+
+验证码必须是 6 位数字。`APP_ENV=production` 时固定验证码会被忽略。
+
+<Callout type="warning">
+不要在公网实例中启用固定验证码。生产环境的组合是 `APP_ENV=production` 加空的 `MULTICA_DEV_VERIFICATION_CODE`。
+</Callout>
+
+## Google 登录
+
+1. 在 [Google Cloud Console](https://console.cloud.google.com/) 创建 OAuth 2.0 client。
+2. 把 Multica 前端的回调地址加入 **Authorized redirect URIs**：
+
+ ```text
+ https://multica.example.com/auth/callback
+ ```
+
+3. 设置：
+
+ ```dotenv
+ GOOGLE_CLIENT_ID=xxxxx.apps.googleusercontent.com
+ GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxx
+ GOOGLE_REDIRECT_URI=https://multica.example.com/auth/callback
+ ```
+
+4. 重启 API 服务。
+
+Google Console 与 `GOOGLE_REDIRECT_URI` 中的地址必须完全一致，包括协议、端口和结尾斜杠。配置生效后，登录页会出现 Google 登录按钮；前端镜像不需要重新构建。
+
+## 注册范围控制
+
+三个变量共同决定新账号能否创建：
+
+| 变量 | 作用 |
+|---|---|
+| `ALLOWED_EMAILS` | 允许的完整邮箱，多个值用逗号分隔 |
+| `ALLOWED_EMAIL_DOMAINS` | 允许的邮箱域名，多个值用逗号分隔 |
+| `ALLOW_SIGNUP` | 未配置任何白名单时，是否允许注册；默认 `true` |
+
+判断顺序如下：
+
+1. 邮箱命中 `ALLOWED_EMAILS`，允许；
+2. 或域名命中 `ALLOWED_EMAIL_DOMAINS`，允许；
+3. 未命中时，如果 `ALLOW_SIGNUP=false`，拒绝；
+4. `ALLOW_SIGNUP=true` 但设置了任意白名单且未命中，仍然拒绝；
+5. 没有设置白名单且 `ALLOW_SIGNUP=true`，允许。
+
+常见配置：
+
+```dotenv
+# 只允许公司域名
+ALLOW_SIGNUP=false
+ALLOWED_EMAIL_DOMAINS=company.com
+
+# 再放行一位外部协作者
+ALLOWED_EMAILS=partner@example.net
+```
+
+<Callout type="info">
+两个白名单在 `ALLOW_SIGNUP=false` 时也可以作为明确的例外名单。
+</Callout>
+
+## 邀请与注册限制
+
+邀请不会自动绕过注册限制：
+
+- 对方已经有 Multica 账号时，可以登录并接受邀请；
+- 对方还没有账号时，邮箱必须符合上面的注册规则。
+
+在关闭开放注册的实例中邀请新成员时，先把对方邮箱加入 `ALLOWED_EMAILS`。账号创建并接受邀请后，可以再从名单中移除。
+
+## 登录有效期
+
+会话会滑动续期。下面这个值是**闲置**上限，不是从登录开始倒计时：会话剩余有效期低于一半时，下一个请求就会把它续到完整有效期，所以持续使用的账号不会被定时踢出。没有绝对上限。
+
+这个上限是单边的。只有掉到一半以下才会续期，因此最后一次使用时仍有超过一半有效期的会话不会被延长 —— 能保证活下来的闲置时长是下面这个值的一半，而不是全部。
+
+可以用 `AUTH_TOKEN_TTL` 调整，支持 Go duration 或正整数秒数：
+
+```dotenv
+AUTH_TOKEN_TTL=720h
+```
+
+最小值是 `60s`，更小的取值会被上调到 `60s` 并在启动时打出警告。低于这个值时，服务端算出的续期检查间隔会低于客户端对它设置的下限，客户端的检查频率就会低于会话能存活的时长。
+
+修改后需要重启 API 服务。这个值对之后签发或续期的会话生效 —— 因为会话会滑动续期，已有会话会在下次续期时用上新的有效期。
+
+## 接下来
+
+- [环境变量](/environment-variables) — 完整变量参考。
+- [认证与令牌](/auth-tokens) — 登录会话与令牌类型。
+- [成员与权限](/members-roles) — 邀请与角色。

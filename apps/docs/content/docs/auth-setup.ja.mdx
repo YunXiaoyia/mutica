@@ -1,0 +1,162 @@
+---
+title: ログインとサインアップ
+description: メール認証コード、Google ログイン、新規登録の範囲を設定します。
+---
+
+import { Callout } from "fumadocs-ui/components/callout";
+
+Multica はデフォルトでメール認証コードによるログインを使い、Google OAuth を追加することもできます。既存のユーザーはいつでも再ログインできます。サインアップ制限は、新しいアカウントを作成できるかどうかだけを決めます。
+
+## メール認証コード
+
+ユーザーがメールアドレスを入力すると、Multica は 6 桁の認証コードを送信します。コードは 10 分間有効で、検証に成功するとブラウザにログイン cookie が発行されます。
+
+メールは Resend または SMTP で送信できます。両方を設定した場合は `SMTP_HOST` が優先されます。
+
+### Resend を使う
+
+1. [Resend](https://resend.com/) で送信ドメインを検証し、API key を作成します。
+2. 次を設定します:
+
+   ```dotenv
+   RESEND_API_KEY=re_xxxxxxxxxxxxxxxx
+   RESEND_FROM_EMAIL=noreply@example.com
+   ```
+
+3. API サービスを再起動します。
+
+`RESEND_FROM_EMAIL` は、Resend で検証済みのドメインに属している必要があります。
+
+### SMTP を使う
+
+最低限、ホストと送信元アドレスを設定します:
+
+```dotenv
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=multica
+SMTP_PASSWORD=<password>
+SMTP_FROM_EMAIL=noreply@example.com
+```
+
+一般的な接続方式:
+
+| シナリオ | 設定 |
+|---|---|
+| 内部の匿名 relay | `SMTP_PORT=25`。ユーザー名とパスワードは空のまま |
+| STARTTLS | `SMTP_PORT=587`。サーバーが対応していればデフォルトで TLS にアップグレード |
+| 暗黙的 TLS | `SMTP_PORT=465`、または `SMTP_TLS=implicit` を明示的に設定 |
+
+`SMTP_FROM_EMAIL` が未設定の場合は `RESEND_FROM_EMAIL` にフォールバックします。プライベート CA や自己署名証明書を使う場合は、CA をコンテナの信頼ストアに追加してください。`SMTP_TLS_INSECURE=true` は証明書検証をスキップするため、信頼できる内部ネットワークで一時的に使う場合に限ってください。
+
+一部の厳格な relay は、有効な EHLO 名も要求します:
+
+```dotenv
+SMTP_EHLO_NAME=mail.example.com
+```
+
+### メールサービスがない場合の動作
+
+サーバーは起動しますが、認証コードと招待リンクはログに書き込まれるだけで、メールは送信されません。ローカル開発には向きますが、プロダクションには向きません。
+
+起動ログには、現在使っているのが `Resend API`、`SMTP relay`、`DEV mode` のどれかが表示されます。
+
+## ローカル固定認証コード
+
+ローカルの自動テストでは、固定の認証コードを設定できます:
+
+```dotenv
+APP_ENV=development
+MULTICA_DEV_VERIFICATION_CODE=888888
+```
+
+認証コードは 6 桁の数字である必要があります。`APP_ENV=production` のときは固定コードは無視されます。
+
+<Callout type="warning">
+公開インスタンスで固定認証コードを有効にしないでください。プロダクションの組み合わせは `APP_ENV=production` と空の `MULTICA_DEV_VERIFICATION_CODE` です。
+</Callout>
+
+## Google ログイン
+
+1. [Google Cloud Console](https://console.cloud.google.com/) で OAuth 2.0 client を作成します。
+2. Multica フロントエンドのコールバックアドレスを **Authorized redirect URIs** に追加します:
+
+   ```text
+   https://multica.example.com/auth/callback
+   ```
+
+3. 次を設定します:
+
+   ```dotenv
+   GOOGLE_CLIENT_ID=xxxxx.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxx
+   GOOGLE_REDIRECT_URI=https://multica.example.com/auth/callback
+   ```
+
+4. API サービスを再起動します。
+
+Google Console と `GOOGLE_REDIRECT_URI` のアドレスは、プロトコル、ポート、末尾のスラッシュを含めて完全に一致している必要があります。設定が反映されると、ログインページに Google ログインボタンが表示されます。フロントエンドイメージの再ビルドは不要です。
+
+## サインアップ制限
+
+3 つの変数が組み合わさって、新しいアカウントを作成できるかどうかを決めます:
+
+| 変数 | 効果 |
+|---|---|
+| `ALLOWED_EMAILS` | 登録を許可する完全なメールアドレス。複数はカンマ区切り |
+| `ALLOWED_EMAIL_DOMAINS` | 登録を許可するメールドメイン。複数はカンマ区切り |
+| `ALLOW_SIGNUP` | allowlist が一つも設定されていない場合に新規登録を許可するか。デフォルトは `true` |
+
+判定順序は次のとおりです:
+
+1. メールアドレスが `ALLOWED_EMAILS` に一致すれば許可。
+2. またはドメインが `ALLOWED_EMAIL_DOMAINS` に一致すれば許可。
+3. どちらにも一致せず、`ALLOW_SIGNUP=false` なら拒否。
+4. `ALLOW_SIGNUP=true` でも、いずれかの allowlist が設定されていて一致しなければ、やはり拒否。
+5. allowlist が一つも設定されておらず、`ALLOW_SIGNUP=true` なら許可。
+
+よくある設定:
+
+```dotenv
+# 会社ドメインのみ許可
+ALLOW_SIGNUP=false
+ALLOWED_EMAIL_DOMAINS=company.com
+
+# 外部コラボレーターを 1 人追加で許可
+ALLOWED_EMAILS=partner@example.net
+```
+
+<Callout type="info">
+2 つの allowlist は、`ALLOW_SIGNUP=false` のときには明示的な例外リストとしても機能します。
+</Callout>
+
+## 招待とサインアップ制限
+
+招待はサインアップ制限を自動的には迂回しません:
+
+- 相手がすでに Multica アカウントを持っている場合は、ログインして招待を受諾できます。
+- まだアカウントがない場合は、そのメールアドレスが上記のサインアップルールを満たす必要があります。
+
+オープンなサインアップを無効にしたインスタンスで新しいメンバーを招待するときは、先に相手のメールアドレスを `ALLOWED_EMAILS` に追加してください。アカウントが作成され、招待が受諾されたら、エントリを削除して構いません。
+
+## セッション有効期間
+
+セッションはスライド更新されます。以下の値はサインインからのカウントダウンではなく、**アイドル**の上限です。残り有効期間が半分を下回ると、次のリクエストで完全な有効期間に再発行されるため、使い続けているアカウントが定期的にサインアウトされることはありません。絶対的な上限はありません。
+
+この上限は片側のみです。半分を下回ってからでないと再発行されないため、最後の利用時点で半分以上残っていたセッションは延長されません。常に耐えられるアイドル時間は、以下の値の半分です。
+
+`AUTH_TOKEN_TTL` で調整でき、Go duration または正の整数秒を受け付けます:
+
+```dotenv
+AUTH_TOKEN_TTL=720h
+```
+
+最小値は `60s` です。これより短い値は `60s` に補正され、起動時に警告が記録されます。これを下回ると、サーバーが導出する更新チェック間隔がクライアント側の下限を割り込み、セッションが存続できる時間よりも低い頻度でしかチェックされなくなります。
+
+変更後は API サービスの再起動が必要です。この値は以降に発行・再発行されるセッションに適用されます。セッションはスライド更新されるため、既存のセッションも次の再発行時に新しい有効期間を受け取ります。
+
+## 次のステップ
+
+- [環境変数](/environment-variables) — 変数の完全なリファレンス。
+- [認証とトークン](/auth-tokens) — ログインセッションとトークンの種類。
+- [メンバーとロール](/members-roles) — 招待とロール。
