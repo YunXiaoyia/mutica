@@ -34,6 +34,17 @@ read any other session or channel.`,
 	RunE: runChatHistory,
 }
 
+var chatNotifyCmd = &cobra.Command{
+	Use:   "notify --session <id> --message <text>",
+	Short: "Post a report into a chat session and wake its agent",
+	Long: `Deliver a report (for example a stage completion) into the given chat
+session and enqueue a turn for the session's agent. Intended for agents
+reporting back to an orchestrator mid-pipeline: the session's creator must be
+the account your task runs under.`,
+	Args: cobra.NoArgs,
+	RunE: runChatNotify,
+}
+
 var chatThreadCmd = &cobra.Command{
 	Use:   "thread [id]",
 	Short: "Read one thread's messages (the current thread, or a specific id)",
@@ -53,8 +64,35 @@ func init() {
 		c.Flags().String("before", "", "Opaque cursor (a next_cursor from a prior page) to read older messages")
 		c.Flags().String("output", "json", "Output format: table or json")
 	}
+	chatNotifyCmd.Flags().String("session", "", "Chat session id to deliver into (required)")
+	chatNotifyCmd.Flags().String("message", "", "Report text delivered as one chat turn (required)")
+	_ = chatNotifyCmd.MarkFlagRequired("session")
+	_ = chatNotifyCmd.MarkFlagRequired("message")
 	chatCmd.AddCommand(chatHistoryCmd)
 	chatCmd.AddCommand(chatThreadCmd)
+	chatCmd.AddCommand(chatNotifyCmd)
+}
+
+func runChatNotify(cmd *cobra.Command, args []string) error {
+	session, _ := cmd.Flags().GetString("session")
+	message, _ := cmd.Flags().GetString("message")
+	if session == "" || message == "" {
+		return fmt.Errorf("--session and --message are required")
+	}
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cli.APIContext(cmd.Context())
+	defer cancel()
+	var out struct {
+		Queued bool `json:"queued"`
+	}
+	if err := client.PostJSON(ctx, "/api/chat/sessions/"+session+"/notify", map[string]string{"content": message}, &out); err != nil {
+		return fmt.Errorf("notify chat session: %w", err)
+	}
+	fmt.Println("queued")
+	return nil
 }
 
 func runChatHistory(cmd *cobra.Command, _ []string) error {

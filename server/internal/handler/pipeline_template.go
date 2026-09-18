@@ -604,6 +604,9 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 		}
 		created = append(created, &child.Issue)
 		setMeta(child.Issue.ID, "pipeline_root", jsonRawString(uuidToString(parent.Issue.ID)))
+		if sessionID.Valid {
+			setMeta(child.Issue.ID, "orchestrator_session", jsonRawString(uuidToString(sessionID)))
+		}
 		setMeta(child.Issue.ID, "pipeline_stage_name", jsonRawString(st.Name))
 		setMeta(child.Issue.ID, "advance_mode", jsonRawString(st.AdvanceMode))
 		if st.RequiresHumanGate {

@@ -698,6 +698,9 @@ func main() {
 	// claim until the cache TTL expires.
 	taskSvc, autopilotSvc := backgroundServices(h)
 	registerAutopilotListeners(bus, autopilotSvc)
+	// Pipeline chat bridge (WP-3, docs/aris-paper-pipeline.md): report task
+	// outcomes on pipeline issues into the orchestrator's chat session.
+	handler.RegisterPipelineChatBridge(bus, taskSvc)
 
 	// Construct a LivenessStore that mirrors the one wired into the HTTP
 	// handler. Both the heartbeat write path (handler) and the sweeper read
