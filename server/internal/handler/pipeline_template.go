@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -546,6 +548,17 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 		BroadcastPayload: broadcast,
 	})
 	if err != nil {
+		// Mirror CreateIssue's error mapping: an active duplicate is the one
+		// client-recoverable outcome here (rerun with a different title).
+		if errors.Is(err, service.ErrActiveDuplicate) {
+			writeError(w, http.StatusConflict, "an active issue with this title already exists; use a different title")
+			return
+		}
+		if errors.Is(err, service.ErrParentIssueNotFound) || errors.Is(err, service.ErrProjectNotFound) {
+			writeError(w, http.StatusBadRequest, "pipeline root references a missing parent or project")
+			return
+		}
+		slog.Warn("instantiate: root issue create failed", "error", err, "template_id", uuidToString(tpl.ID))
 		writeError(w, http.StatusInternalServerError, "failed to create pipeline root issue")
 		return
 	}
@@ -566,10 +579,10 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 			Key: key, Value: encoded, ID: issueID, WorkspaceID: wsUUID,
 		})
 	}
-	setMeta(parent.Issue.ID, "pipeline", `"active"`)
-	setMeta(parent.Issue.ID, "pipeline_template", jsonRawString(fmt.Sprintf("%s:v%d", tpl.Name, tpl.Version)))
+	setMeta(parent.Issue.ID, "pipeline", "active")
+	setMeta(parent.Issue.ID, "pipeline_template", fmt.Sprintf("%s:v%d", tpl.Name, tpl.Version))
 	if sessionID.Valid {
-		setMeta(parent.Issue.ID, "orchestrator_session", jsonRawString(uuidToString(sessionID)))
+		setMeta(parent.Issue.ID, "orchestrator_session", uuidToString(sessionID))
 	}
 
 	// Phase A: every child is born in backlog — parked, so neither the
@@ -603,14 +616,14 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 			return
 		}
 		created = append(created, &child.Issue)
-		setMeta(child.Issue.ID, "pipeline_root", jsonRawString(uuidToString(parent.Issue.ID)))
+		setMeta(child.Issue.ID, "pipeline_root", uuidToString(parent.Issue.ID))
 		if sessionID.Valid {
-			setMeta(child.Issue.ID, "orchestrator_session", jsonRawString(uuidToString(sessionID)))
+			setMeta(child.Issue.ID, "orchestrator_session", uuidToString(sessionID))
 		}
-		setMeta(child.Issue.ID, "pipeline_stage_name", jsonRawString(st.Name))
-		setMeta(child.Issue.ID, "advance_mode", jsonRawString(st.AdvanceMode))
+		setMeta(child.Issue.ID, "pipeline_stage_name", st.Name)
+		setMeta(child.Issue.ID, "advance_mode", st.AdvanceMode)
 		if st.RequiresHumanGate {
-			setMeta(child.Issue.ID, "human_gate", `"true"`)
+			setMeta(child.Issue.ID, "human_gate", "true")
 		}
 		childrenByStage[st.StageOrder] = append(childrenByStage[st.StageOrder], child.Issue)
 		childResponses = append(childResponses, PipelineRunChildResponse{
@@ -671,11 +684,6 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 		RootIssueID: uuidToString(parent.Issue.ID),
 		Children:    childResponses,
 	})
-}
-
-func jsonRawString(s string) string {
-	encoded, _ := json.Marshal(s)
-	return string(encoded)
 }
 
 // activatePipelineChild flips one parked child from backlog to todo and
