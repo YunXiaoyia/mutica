@@ -173,7 +173,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_dependency_depends_on_idx
 | --- | --- |
 | `GET/POST /api/pipeline-templates` | 列表 / 创建（含 stages 整体提交，服务端校验 stage_order 连续、agent 属于本 workspace） |
 | `GET/PUT/DELETE /api/pipeline-templates/{id}` | 详情 / 整体更新（bump version，旧版本保留）/ 删除（有运行中实例则拒绝） |
-| `POST /api/pipeline-templates/{id}/instantiate` | 实例化。入参：`{title, description, variables, orchestrator_session_id?}`。单事务内：建父 issue（todo、accepted、assignee=模板 orchestrator）、建全部子 issue、写 stage/blocked_by/metadata、入队第 0 阶段。返回父 issue ref 与子 issue 列表 |
+| `POST /api/pipeline-templates/{id}/instantiate` | 实例化。入参：`{title, description, orchestrator_session_id?}`。实现说明（最终实现与设计初稿的偏差）：子 issue 全部以 backlog 创建（backlog 停放天然压制创建即触发），随后接 blocked_by 边，最后 auto 阶段经 WillEnqueueRun+dispatch 翻转为 todo——分阶段推进而非单事务，换来完全复用 IssueService.Create 的事件、编号与触发管线；失败时按创建逆序做应用层清理（表无外键） |
 | `POST /api/issues/{id}/dependencies` | 维护 blocked_by（带环检测），供模板外手工补依赖 |
 | `POST /api/pipeline-runs/{rootId}/advance` | 主理人 promote 专用：把 `orchestrator_review` 阶段的 backlog 子 issue 批量 promote（等价于逐个状态变更，走同一触发路径） |
 
