@@ -45,15 +45,17 @@ ROSTER = {
     "Scout": (
         "选题与新颖性把关。",
         "You propose and validate paper topics. Follow the idea-discovery and "
-        "novelty-check skills. Output: a ranked shortlist with evidence, then "
-        "stop.",
-        ["idea-discovery", "novelty-check", "shared-references"],
+        "novelty-check skills, with alphaxiv for arxiv-wide signal scanning. "
+        "Output: a ranked shortlist with evidence, then stop.",
+        ["idea-discovery", "novelty-check", "alphaxiv", "shared-references"],
     ),
     "Researcher": (
         "文献综述。",
-        "You run literature review. Follow the research-lit and arxiv skills. "
-        "Output: a structured related-work map with citations, then stop.",
-        ["research-lit", "arxiv", "shared-references"],
+        "You run literature review. Follow the research-lit and arxiv skills, "
+        "with deepxiv and comm-lit-review for deep reading and "
+        "community-discussion grounding. Output: a structured related-work map "
+        "with citations, then stop.",
+        ["research-lit", "arxiv", "deepxiv", "comm-lit-review", "shared-references"],
     ),
     "Planner": (
         "实验设计。",
@@ -81,9 +83,12 @@ ROSTER = {
     "Writer": (
         "成文与图表。",
         "You write and compile the paper using the paper-write, paper-figure "
-        "and paper-compile skills. Keep the paper in the shared git repo; "
-        "commit per revision. Output: updated repo + compile status, then stop.",
-        ["paper-write", "paper-figure", "paper-compile", "shared-references"],
+        "and paper-compile skills, with citation-audit for reference integrity "
+        "and claims-drafting for contribution statements. Keep the paper in the "
+        "shared git repo; commit per revision. Output: updated repo + compile "
+        "status, then stop.",
+        ["paper-write", "paper-figure", "paper-compile", "citation-audit",
+         "claims-drafting", "shared-references"],
     ),
     "Reviewer": (
         "内审与修订意见。",
