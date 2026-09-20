@@ -100,7 +100,11 @@ export const SHORTCUT_ACTIONS: readonly ShortcutActionDefinition[] = [
     defaultShortcut: createShortcutChord("E"),
     allowInEditable: false,
   },
-  { id: "send", category: "general", defaultShortcut: primary("Enter"), allowInEditable: true },
+  // Fork default: plain Enter sends (Shift+Enter inserts a newline — the
+  // submit-shortcut extension replays the native Enter keymap for it). This
+  // fork's primary users type Chinese; the IME composing guard in the
+  // submit-shortcut extension keeps candidate-window Enter from firing.
+  { id: "send", category: "general", defaultShortcut: createShortcutChord("Enter"), allowInEditable: true },
   // Browser-style history navigation (Mod+[ / Mod+]). Neither bracket is
   // app-owned (PRIMARY_RESERVED_KEYS) nor browser-owned
   // (BROWSER_ONLY_PRIMARY_RESERVED_KEYS), so both are recordable on every
