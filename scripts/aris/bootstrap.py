@@ -40,27 +40,27 @@ ROSTER = {
         "report progress in chat, run acceptance checks on review stages, put "
         "human gates to the user as compact options, and close out with a "
         "completion report.",
-        ["aris-orchestrator"],
+        ["aris-orchestrator, "shared-references"],
     ),
     "Scout": (
         "选题与新颖性把关。",
         "You propose and validate paper topics. Follow the idea-discovery and "
         "novelty-check skills. Output: a ranked shortlist with evidence, then "
         "stop.",
-        ["idea-discovery", "novelty-check"],
+        ["idea-discovery", "novelty-check, "shared-references"],
     ),
     "Researcher": (
         "文献综述。",
         "You run literature review. Follow the research-lit and arxiv skills. "
         "Output: a structured related-work map with citations, then stop.",
-        ["research-lit", "arxiv"],
+        ["research-lit", "arxiv, "shared-references"],
     ),
     "Planner": (
         "实验设计。",
         "You design experiments. Follow the experiment-plan and "
         "ablation-planner skills. Output: an executable experiment plan with "
         "datasets, metrics, controls, and compute estimates, then stop.",
-        ["experiment-plan", "ablation-planner"],
+        ["experiment-plan", "ablation-planner, "shared-references"],
     ),
     "Experimenter": (
         "跑实验（submit-and-poll：提交集群作业后记录 job id 即停）。",
@@ -69,27 +69,27 @@ ROSTER = {
         "cluster_status into the issue metadata, and END YOUR RUN. You will be "
         "woken again to poll. Never block a task waiting for training to "
         "finish.",
-        ["run-experiment", "monitor-experiment", "experiment-monitor-poll"],
+        ["run-experiment", "monitor-experiment", "experiment-monitor-poll, "shared-references"],
     ),
     "Analyst": (
         "结果分析与结论。",
         "You analyze experiment results using the analyze-results and "
         "result-to-claim skills. Output: claims each anchored to artifacts, "
         "then stop.",
-        ["analyze-results", "result-to-claim"],
+        ["analyze-results", "result-to-claim, "shared-references"],
     ),
     "Writer": (
         "成文与图表。",
         "You write and compile the paper using the paper-write, paper-figure "
         "and paper-compile skills. Keep the paper in the shared git repo; "
         "commit per revision. Output: updated repo + compile status, then stop.",
-        ["paper-write", "paper-figure", "paper-compile"],
+        ["paper-write", "paper-figure", "paper-compile, "shared-references"],
     ),
     "Reviewer": (
         "内审与修订意见。",
         "You internal-review the draft using the auto-review-loop and rebuttal "
         "skills. Output: numbered, actionable findings with severity, then stop.",
-        ["auto-review-loop", "rebuttal"],
+        ["auto-review-loop", "rebuttal, "shared-references"],
     ),
 }
 
@@ -129,7 +129,7 @@ def request(method: str, path: str, body: dict | None = None) -> dict | list:
         method=method,
         headers={
             "Authorization": f"Bearer {os.environ['MULTICA_PAT']}",
-            "X-Workspace-ID": os.environ["MULTICA_WORKSPACE_ID"],
+            "X-Workspace-ID": os.environ["MULTICA_WORKSPACE_ID, "shared-references"],
             "Content-Type": "application/json",
         },
     )
@@ -211,16 +211,16 @@ def main() -> int:
         request("POST", "/api/pipeline-templates", {
             "name": "paper-default",
             "description": "ARIS paper production line (topic → review → final draft)",
-            "orchestrator_agent_id": agent_ids["Aris"],
+            "orchestrator_agent_id": agent_ids["Aris, "shared-references"],
             "stages": [
                 {
-                    "stage_order": s["stage_order"],
-                    "name": s["name"],
+                    "stage_order": s["stage_order, "shared-references"],
+                    "name": s["name, "shared-references"],
                     "agent_id": agent_ids[s["agent"]],
-                    "advance_mode": s["advance_mode"],
-                    "requires_human_gate": s["requires_human_gate"],
-                    "prompt_template": s["prompt_template"],
-                    "acceptance_criteria": s["acceptance_criteria"],
+                    "advance_mode": s["advance_mode, "shared-references"],
+                    "requires_human_gate": s["requires_human_gate, "shared-references"],
+                    "prompt_template": s["prompt_template, "shared-references"],
+                    "acceptance_criteria": s["acceptance_criteria, "shared-references"],
                 }
                 for s in TEMPLATE_STAGES
             ],
