@@ -36,12 +36,12 @@ reused when present.
 | Agent | Skills | Pipeline role |
 | --- | --- | --- |
 | Aris | aris-orchestrator | orchestrator (parent issue assignee) |
-| Scout | idea-discovery, novelty-check | topic discovery |
-| Researcher | research-lit, arxiv | literature review |
+| Scout | idea-discovery, novelty-check, alphaxiv | topic discovery |
+| Researcher | research-lit, arxiv, deepxiv, comm-lit-review | literature review |
 | Planner | experiment-plan, ablation-planner | experiment design |
 | Experimenter | run-experiment, monitor-experiment, experiment-monitor-poll | experiments (submit-and-poll) |
 | Analyst | analyze-results, result-to-claim | analysis |
-| Writer | paper-write, paper-figure, paper-compile | writing + figures |
+| Writer | paper-write, paper-figure, paper-compile, citation-audit, claims-drafting | writing + figures |
 | Reviewer | auto-review-loop, rebuttal | internal review |
 
 Skills listed here but not present in `skills/` are skipped by the binder —
