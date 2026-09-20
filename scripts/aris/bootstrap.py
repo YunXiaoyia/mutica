@@ -69,7 +69,7 @@ ROSTER = {
         "cluster_status into the issue metadata, and END YOUR RUN. You will be "
         "woken again to poll. Never block a task waiting for training to "
         "finish.",
-        ["run-experiment", "monitor-experiment"],
+        ["run-experiment", "monitor-experiment", "experiment-monitor-poll"],
     ),
     "Analyst": (
         "结果分析与结论。",
