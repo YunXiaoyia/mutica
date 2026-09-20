@@ -34,12 +34,12 @@ from sync_skills import API  # noqa: E402
 # name -> (description, instructions, [skills])
 ROSTER = {
     "Aris": (
-        "论文流水线主理人：只协调，不执行。",
+        "论文流水线主理人：只协调，不执行。严格执行立项建仓SOP与4090服务器协同规范。",
         "You are the paper pipeline orchestrator. Follow the aris-orchestrator "
-        "skill exactly: confirm intake, instantiate the pipeline template, "
-        "report progress in chat, run acceptance checks on review stages, put "
-        "human gates to the user as compact options, and close out with a "
-        "completion report.",
+        "skill exactly: confirm intake, bootstrap the persistent repo at "
+        "/workspace/work/<project_slug> with git init & AGENTS.md, instantiate "
+        "the pipeline template, bind stage tasks to the repo, enforce ssh 4090 "
+        "GPU protocol, report progress in chat, run acceptance checks, and close out.",
         ["aris-orchestrator", "shared-references"],
     ),
     "Scout": (
@@ -210,29 +210,36 @@ def main() -> int:
             print(f"  {name}: {len(ids)} skill(s)")
 
     # 4. Default template (idempotent by name+version).
-    print("== pipeline template ==")
+    print("== pipeline template ==") # updated
     templates = request("GET", "/api/pipeline-templates")
-    if not any(t["name"] == "paper-default" and t["version"] == 1 for t in templates):
+    existing_tpl = next((t for t in templates if t["name"] == "paper-default"), None)
+    stage_payload = [
+        {
+            "stage_order": s["stage_order"],
+            "name": s["name"],
+            "agent_id": agent_ids[s["agent"]],
+            "advance_mode": s["advance_mode"],
+            "requires_human_gate": s["requires_human_gate"],
+            "prompt_template": s["prompt_template"],
+            "acceptance_criteria": s["acceptance_criteria"],
+        }
+        for s in TEMPLATE_STAGES
+    ]
+    if existing_tpl:
+        request("PUT", f"/api/pipeline-templates/{existing_tpl['id']}", {
+            "description": "ARIS paper production line (topic → review → final draft) [SOP & 4090 enforced]",
+            "orchestrator_agent_id": agent_ids["Aris"],
+            "stages": stage_payload,
+        })
+        print("  updated paper-default template with latest SOP & stages")
+    else:
         request("POST", "/api/pipeline-templates", {
             "name": "paper-default",
-            "description": "ARIS paper production line (topic → review → final draft)",
+            "description": "ARIS paper production line (topic → review → final draft) [SOP & 4090 enforced]",
             "orchestrator_agent_id": agent_ids["Aris"],
-            "stages": [
-                {
-                    "stage_order": s["stage_order"],
-                    "name": s["name"],
-                    "agent_id": agent_ids[s["agent"]],
-                    "advance_mode": s["advance_mode"],
-                    "requires_human_gate": s["requires_human_gate"],
-                    "prompt_template": s["prompt_template"],
-                    "acceptance_criteria": s["acceptance_criteria"],
-                }
-                for s in TEMPLATE_STAGES
-            ],
+            "stages": stage_payload,
         })
         print("  created paper-default")
-    else:
-        print("  paper-default already exists")
 
     # 5. Orchestrator chat session (the 主理人窗口).
     print("== orchestrator chat session ==")

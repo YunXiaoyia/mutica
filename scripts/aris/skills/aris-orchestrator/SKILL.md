@@ -23,25 +23,43 @@ agent, its acceptance criteria, and how it advances:
 
 1. **Intake.** When the user states a goal, confirm four things before any
    work starts: research direction and constraints, target venue/tier,
-   timeline, and available compute. Ask what is missing; do not guess.
+   timeline, and available compute (clarify remote RTX 4090 GPU server availability).
+   Ask what is missing; do not guess.
 
-2. **Kick off.** Instantiate the template with the agreed goal, then post the
-   plan back to chat: one line per stage — name, executor, advance mode,
-   acceptance criteria. Attach the parent issue link.
+2. **Kick off & Project Bootstrap (MANDATORY SOP).**
+   Before dispatching any stage tasks to specialist agents:
+   a. Formulate a slug for the project (e.g., `<project-slug>`, lowercase alphanumeric with hyphens).
+   b. Establish the persistent research repository on the local host at `/workspace/work/<project-slug>/`.
+      Never leave stage deliverables scattered across temporary runner sandboxes!
+      Run:
+      ```bash
+      mkdir -p /workspace/work/<project-slug>/{docs,src,experiments,results,paper}
+      git -C /workspace/work/<project-slug> init
+      ```
+   c. Write or copy the project `AGENTS.md` into `/workspace/work/<project-slug>/AGENTS.md` containing:
+      - Host topology: Local (`yunyi`, `/workspace/work/<project-slug>/`) for management and writing; Remote 4090 (`ae4090`, `adminroot`, IP 172.18.49.6) for GPU training and simulation.
+      - 4090 GPU Server Constraint: All GPU workloads, checkpoint probing, and simulation MUST execute via `ssh 4090 <cmd>`. Strictly forbid treating `/home/adminroot/...` as local paths or hallucinating theoretical fallbacks.
+      - Commit the initial repo setup: `git -C /workspace/work/<project-slug> add -A && git -C /workspace/work/<project-slug> commit -m "feat: bootstrap research repository"`
+   d. Instantiate the pipeline template with the agreed goal:
+      `multica pipeline instantiate --template <id> --title "<goal>"`
+   e. Ensure all stage issues are bound to `/workspace/work/<project-slug>/`:
+      Update stage issue descriptions so every specialist knows the target repo path and the `ssh 4090` constraint.
+   f. Post the kick-off plan back to chat: one line per stage — name, executor, advance mode, acceptance criteria. Attach the parent issue link.
 
 3. **Dispatch.** Work reaches specialists only through issues. The template
    assigns each stage; for out-of-plan work create an issue with an agent
    assignee in an active status (creating with an active assignee fires the
    run). Never do stage work in your own run, never edit stage issues' work
-   yourself.
+   yourself. Mandate that every specialist agent writes its deliverables into
+   `/workspace/work/<project-slug>/` and commits changes to Git.
 
 4. **Observe.** You are woken when a stage barrier closes or the chat bridge
    reports a task outcome. On wake: `multica issue list --metadata
    pipeline_root=<root>` and `multica issue runs --siblings` to see where
    things stand. For `auto` stages, report progress and stop. For
    `orchestrator_review` stages, verify the acceptance criteria in the child
-   description against the actual artifacts (read the child issue, its
-   comments, and the linked repo paths) before promoting.
+   description against the actual artifacts in `/workspace/work/<project-slug>/`
+   (read the child issue, its comments, and verify git commits) before promoting.
 
 5. **Human gates.** A stage with `human_gate=true` is a decision point
    (topic, outline, final draft). Present the user a compact summary plus 2-3
