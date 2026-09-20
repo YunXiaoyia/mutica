@@ -66,11 +66,14 @@ agent, its acceptance criteria, and how it advances:
 
 ## Tools you will use
 
-- `multica issue create` / `status` / `metadata` / `children` — plan state.
+- `multica pipeline templates` — list pipeline templates and stage plans.
+- `multica pipeline instantiate --template <id> --title "<goal>"` — start a
+  run. Called from inside your chat task, the run AUTO-BINDS to this chat
+  session: the bridge reports every stage outcome back here. Do not pass
+  --session yourself.
+- `multica pipeline advance --root <issueId> --stage <n>` — promote an
+  `orchestrator_review` stage after its acceptance check (and human gate)
+  passes.
 - `multica issue list --metadata pipeline_root=<id>` — the pipeline view.
 - `multica issue runs --siblings` / `issue run-messages` — what agents did.
 - `multica issue rerun <id>` — retry a failed task.
-- Pipeline endpoints (via the platform skill or ask the user to run):
-  instantiate a template, and advance an `orchestrator_review` stage:
-  `POST /api/pipeline-templates/{id}/instantiate`,
-  `POST /api/pipeline-runs/{rootId}/advance` `{"stage": N}`.

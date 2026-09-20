@@ -502,11 +502,19 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 		if !parseSession {
 			return
 		}
-		if _, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{ID: id, WorkspaceID: wsUUID}); err != nil {
-			writeError(w, http.StatusBadRequest, "orchestrator_session_id does not exist in this workspace")
+		sessionID = id
+	} else {
+		// Chat-driven instantiate: default the binding to the conversation the
+		// calling agent task is running in, so a pipeline started from the
+		// orchestrator's chat reports back into that same chat (WP-3 bridge)
+		// without the agent having to know its own session id.
+		sessionID = h.callingChatSession(r)
+	}
+	if sessionID.Valid {
+		if _, err := h.Queries.GetChatSessionInWorkspace(r.Context(), db.GetChatSessionInWorkspaceParams{ID: sessionID, WorkspaceID: wsUUID}); err != nil {
+			writeError(w, http.StatusBadRequest, "orchestrator session does not exist in this workspace")
 			return
 		}
-		sessionID = id
 	}
 	creatorID, err := util.ParseUUID(userID)
 	if err != nil {
@@ -715,6 +723,25 @@ func (h *Handler) activatePipelineChild(r *http.Request, child db.Issue, actorTy
 		"prev_status":    "backlog",
 		"issue_revision": updated.Revision,
 	})
+}
+
+// callingChatSession returns the chat session bound to the agent task making
+// this request (X-Task-ID header), or an invalid UUID for member callers and
+// issue-scoped tasks.
+func (h *Handler) callingChatSession(r *http.Request) pgtype.UUID {
+	taskID := r.Header.Get("X-Task-ID")
+	if taskID == "" {
+		return pgtype.UUID{}
+	}
+	taskUUID, err := util.ParseUUID(taskID)
+	if err != nil {
+		return pgtype.UUID{}
+	}
+	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
+	if err != nil {
+		return pgtype.UUID{}
+	}
+	return task.ChatSessionID
 }
 
 // interpolateStagePrompt fills the {{goal}} / {{description}} slots of a
