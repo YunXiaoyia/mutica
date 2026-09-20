@@ -70,7 +70,11 @@ agent, its acceptance criteria, and how it advances:
 - `multica pipeline instantiate --template <id> --title "<goal>"` — start a
   run. Called from inside your chat task, the run AUTO-BINDS to this chat
   session: the bridge reports every stage outcome back here. Do not pass
-  --session yourself.
+  --session yourself. VERIFY the bind right after instantiating: read the
+  root issue's metadata and confirm `orchestrator_session` is your session
+  id; if it is missing, PUT it (`/api/issues/<rootId>/metadata/orchestrator_session`,
+  body `{"value":"<sessionId>"}`) — without it no stage outcome ever reaches
+  this chat.
 - `multica pipeline advance --root <issueId> --stage <n>` — promote an
   `orchestrator_review` stage after its acceptance check (and human gate)
   passes.

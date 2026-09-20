@@ -105,23 +105,29 @@ func TestPipelineChatBridge_ReportsTaskOutcomeIntoChat(t *testing.T) {
 		Payload: map[string]any{"task_id": taskID},
 	})
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var messages int
-		var content string
-		dbfx.QueryRow(t, `SELECT count(*) FROM chat_message WHERE chat_session_id = $1`, sessionID).Scan(&messages)
-		if messages > 0 {
-			dbfx.QueryRow(t, `SELECT content FROM chat_message WHERE chat_session_id = $1 LIMIT 1`, sessionID).Scan(&content)
-			if !strings.Contains(content, "pipeline report") {
-				t.Fatalf("bridge report must be the persisted message, got %q", content)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var messages int
+			var content string
+			dbfx.QueryRow(t, `SELECT count(*) FROM chat_message WHERE chat_session_id = $1`, sessionID).Scan(&messages)
+			if messages > 0 {
+				dbfx.QueryRow(t, `SELECT content FROM chat_message WHERE chat_session_id = $1 LIMIT 1`, sessionID).Scan(&content)
+				if !strings.Contains(content, "pipeline report") {
+					t.Fatalf("bridge report must be the persisted message, got %q", content)
+				}
+				// The issue status rides along: the orchestrator needs the
+				// completed-task-but-issue-still-in_progress mismatch visible
+				// to rerun a stage instead of advancing the gate.
+				if !strings.Contains(content, "issue status:") {
+					t.Fatalf("bridge report must carry the issue status, got %q", content)
+				}
+				break
 			}
-			break
+			if time.Now().After(deadline) {
+				t.Fatal("bridge must report the task outcome into the orchestrator chat session")
+			}
+			time.Sleep(25 * time.Millisecond)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("bridge must report the task outcome into the orchestrator chat session")
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
 
 	// The report enqueued an orchestrator turn.
 	var tasks int
@@ -147,5 +153,27 @@ func TestPipelineChatBridge_ReportsTaskOutcomeIntoChat(t *testing.T) {
 	dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id = $1 AND status = 'queued'`, sessionID).Scan(&turns)
 	if turns != 1 {
 		t.Fatalf("non-pipeline completions must not wake the orchestrator, got %d turns", turns)
+	}
+
+	// A pipeline-tagged issue with no bound session must not wake the
+	// orchestrator either (the warn path) — an unbound pipeline stalls loudly
+	// in the logs instead of reporting into an unrelated chat.
+	unboundID := dbfx.Issue(t, "Unbound pipeline issue")
+	dbfx.Exec(t, `
+		UPDATE issue SET metadata = metadata || jsonb_build_object('pipeline_root', $2::text)
+		WHERE id = $1`, unboundID, unboundID)
+	unboundTask := createHandlerTestTaskForAgentOnIssue(t, agentID, unboundID)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, unboundID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, unboundID)
+	})
+	bus.Publish(events.Event{
+		Type:    protocol.EventTaskCompleted,
+		Payload: map[string]any{"task_id": unboundTask},
+	})
+	time.Sleep(200 * time.Millisecond)
+	dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id = $1 AND status = 'queued'`, sessionID).Scan(&turns)
+	if turns != 1 {
+		t.Fatalf("unbound pipeline completions must not wake the orchestrator, got %d turns", turns)
 	}
 }

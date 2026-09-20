@@ -75,6 +75,14 @@ func (b *pipelineChatBridge) onTaskEvent(e events.Event) {
 	}
 	sessionID := b.orchestratorSessionFor(issue)
 	if !sessionID.Valid {
+		// A pipeline-tagged issue that resolves to no chat session severs the
+		// orchestrator loop — stage outcomes land nowhere and the run stalls.
+		// This exact gap (a pipeline instantiated before chat-session
+		// auto-binding shipped) stalled a live run silently, so stay loud.
+		if _, ok := metadataString(issue.Metadata, "pipeline_root"); ok {
+			slog.Warn("pipeline bridge: task issue has no orchestrator session bound",
+				"issue_id", uuidToString(issue.ID))
+		}
 		return
 	}
 	session, err := b.taskSvc.Queries.GetChatSession(b.ctx, sessionID)
@@ -86,9 +94,13 @@ func (b *pipelineChatBridge) onTaskEvent(e events.Event) {
 	if e.Type == protocol.EventTaskFailed {
 		outcome = "FAILED"
 	}
+	// The issue status rides along on purpose: an agent can end its task
+	// without moving the issue to a terminal state (models occasionally
+	// narrate a finish and exit). The orchestrator must see that mismatch to
+	// rerun the stage instead of advancing the gate.
 	b.queue(sessionID, fmt.Sprintf(
-		"[pipeline report] The task on issue %s — %q — has %s. Check `multica issue list --metadata pipeline_root=%s` for the full plan and continue the pipeline.",
-		uuidToString(issue.ID), issue.Title, outcome, b.pipelineRootOf(issue)))
+		"[pipeline report] The task on issue %s — %q — has %s (issue status: %s). Check `multica issue list --metadata pipeline_root=%s` for the full plan and continue the pipeline.",
+		uuidToString(issue.ID), issue.Title, outcome, issue.Status, b.pipelineRootOf(issue)))
 }
 
 // orchestratorSessionFor resolves the bound chat session: the issue's own
