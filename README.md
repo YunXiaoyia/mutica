@@ -40,24 +40,34 @@
 
 ### 0. 前置要求
 
-Go ≥ 1.26（首次构建自动拉取 toolchain）、Node 20+ 与 pnpm、Docker、Python 3。
+Docker（保持运行）、Go 1.21+（首次构建自动下载 1.26 toolchain）、Node 20+ 与 pnpm、Python 3（仅 ARIS 配置脚本需要）：
+
+```bash
+npm i -g pnpm        # 或者 corepack enable
+```
 
 ### 1. 启动平台
 
 ```bash
-cp .env.example .env          # 按需修改
+git clone https://github.com/YunXiaoyia/mutica.git
+cd mutica
+cp .env.example .env          # 本地开发用默认值即可，不需要改任何内容
 make up C=api,web,daemon      # 起 API、前端和本地 daemon
-make status                   # 查看本 checkout 分到的地址（形如 web :13436 / api :18516）
+make status                   # 查看本 checkout 分到的地址（每台机器端口不同，以它打印的为准）
 ```
 
-浏览器打开 `make status` 显示的 web 地址，注册账号（dev 模式的邮箱验证码打印在
-`~/.multica/dev/envs/<env>/logs/api.log`）。
+首次启动会自动完成 pnpm install、拉起 PostgreSQL 容器、执行数据库迁移，需要几分钟。
+浏览器打开 `make status` 显示的 **web** 地址注册账号；dev 模式不发真实邮件，**验证码打印在
+api 日志里**（`make status` 会显示 logs 路径，形如 `~/.multica/dev/envs/<环境名>/logs/api.log`，
+搜 `verification code`）。
 
 ### 2. 接入智能体运行时
 
-在本机安装至少一个受支持的 agent CLI（Claude Code、Codex、Antigravity 等）。
-daemon 由 `make up` 拉起，会自动探测本机 CLI；到网页 **运行时** 页确认在线。
-日志在 `~/.multica/daemon.log`。
+在本机安装至少一个受支持的 agent CLI（Claude Code、Codex、Antigravity 等）。daemon 由
+`make up` 拉起，会自动探测本机 CLI；到网页 **运行时** 页确认在线，并把运行时的**可见性设为
+公开**（私有运行时只允许归属者本人绑定智能体）。注意：新装的 CLI 最多要等 30 分钟才会被探测到
+（登录 shell 解析有 30 分钟缓存），想立即生效就 `make multica MULTICA_ARGS="daemon restart"`
+——重启前确认没有正在执行的任务。daemon 日志在 `~/.multica/daemon.log`。
 
 ### 3. 一键配置 ARIS 花名册
 
@@ -88,6 +98,7 @@ Aris 会先和你确认约束，然后实例化流水线、Stage 1 自动开跑�
 
 | 想做什么 | 去哪里 |
 | --- | --- |
+| 启动 / 停止 / 状态 | `make up C=api,web,daemon` · `make down`（数据保留）· `make status` · `make destroy`（连数据删除） |
 | 看流水线进度 | 任务看板，或点开 issue 看实时运行输出 |
 | 人工门拍板、改需求、追问 | Aris 聊天窗口 |
 | 重跑某个阶段 | issue 页「重跑」，或 `make cli ARGS="issue rerun <编号>"` |
