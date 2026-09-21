@@ -183,8 +183,13 @@ env-exec: ## Run a command with this environment's variables (ARGS="-- pnpm dev:
 api-dev: ## Run only the Go backend for the current env file
 	cd server && go run -ldflags "-X main.commit=$(COMMIT)" ./cmd/server
 
-web-dev: ## Run only the Next.js dev server for the current env file
-	pnpm dev:web
+web-dev: ## Run the Next.js frontend (production mode if pre-built, otherwise dev server)
+	@if [ "$${MULTICA_WEB_DEV:-0}" != "1" ] && [ -f apps/web/.next/BUILD_ID ]; then \
+		echo "Starting Next.js in production mode (pre-built)..."; \
+		(cd apps/web && pnpm exec next start --port "$${FRONTEND_PORT:-3000}"); \
+	else \
+		pnpm dev:web; \
+	fi
 
 desktop-dev: ## Run only the Electron desktop app for the current env file
 	pnpm dev:desktop
