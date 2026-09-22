@@ -6578,3 +6578,42 @@ func TestHermesProfileChainCoversLaunchPrefix(t *testing.T) {
 		t.Errorf("custom = %v, want only the selector removed", strippedCustom)
 	}
 }
+
+func TestARISToolsSource(t *testing.T) {
+	orig := resolveSelfExecutable
+	t.Cleanup(func() {
+		resolveSelfExecutable = orig
+		os.Unsetenv("MULTICA_ARIS_TOOLS")
+	})
+
+	override := t.TempDir()
+	t.Setenv("MULTICA_ARIS_TOOLS", override)
+	if got := arisToolsSource(); got != override {
+		t.Fatalf("override = %q, want %q", got, override)
+	}
+
+	t.Setenv("MULTICA_ARIS_TOOLS", filepath.Join(t.TempDir(), "missing"))
+	if got := arisToolsSource(); got != "" {
+		t.Fatalf("missing override = %q, want empty", got)
+	}
+
+	os.Unsetenv("MULTICA_ARIS_TOOLS")
+	root := t.TempDir()
+	tools := filepath.Join(root, "scripts", "aris", "tools")
+	if err := os.MkdirAll(tools, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(root, "server", "bin", "multica")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolveSelfExecutable = func() (string, error) { return bin, nil }
+	if got := arisToolsSource(); got != tools {
+		t.Fatalf("relative source = %q, want %q", got, tools)
+	}
+
+	resolveSelfExecutable = func() (string, error) { return "", errors.New("no bin") }
+	if got := arisToolsSource(); got != "" {
+		t.Fatalf("unresolved binary = %q, want empty", got)
+	}
+}

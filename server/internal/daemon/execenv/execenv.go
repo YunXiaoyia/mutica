@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -81,6 +83,15 @@ type PrepareParams struct {
 	// substituted. Used by the local_directory project_resource flow
 	// (MUL-2663). When set, the envRoot/workdir directory is not created.
 	LocalWorkDir string
+	// CreateLocalWorkDir, when true, creates LocalWorkDir via os.MkdirAll
+	// if it does not already exist. Used by the pipeline_repo flow so the
+	// shared artifact repository directory is ensured before the agent runs.
+	CreateLocalWorkDir bool
+	// ARISToolsSource, when set together with a pipeline workdir, copies that
+	// upstream tools directory into <workdir>/.aris/tools and writes
+	// <workdir>/.aris/installed-skills.txt so skill scripts resolve helpers
+	// without a separate install step. Empty leaves the workdir untouched.
+	ARISToolsSource string
 	// LocalWorktree, when non-nil, is the worktree-mode counterpart of
 	// LocalWorkDir: instead of running in the user's directory, the task gets
 	// its own git worktree of that repo inside envRoot and delivers its work
@@ -498,6 +509,14 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 		scratchDirs = append(scratchDirs, workDir)
 	} else if params.LocalWorkDir != "" {
 		workDir = params.LocalWorkDir
+		if params.CreateLocalWorkDir {
+			if err := os.MkdirAll(workDir, 0o755); err != nil {
+				return nil, fmt.Errorf("execenv: create local workdir %s: %w", workDir, err)
+			}
+		}
+		if err := materializeARISTools(workDir, params.ARISToolsSource); err != nil {
+			return nil, fmt.Errorf("execenv: materialize ARIS tools: %w", err)
+		}
 	}
 	for _, dir := range scratchDirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -801,6 +820,9 @@ type ReuseParams struct {
 	// too (MUL-4957).
 	CodexCustomArgs []string
 	Task            TaskContextForEnv // refreshed context files / skills
+	// ARISToolsSource mirrors PrepareParams.ARISToolsSource so a reused
+	// pipeline repository refreshes .aris/tools before the next stage runs.
+	ARISToolsSource string
 }
 
 // Reuse wraps an existing workdir into an Environment and refreshes context files.
@@ -809,6 +831,12 @@ type ReuseParams struct {
 func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	if _, err := os.Stat(params.WorkDir); err != nil {
 		return nil
+	}
+	if err := materializeARISTools(params.WorkDir, params.ARISToolsSource); err != nil && logger != nil {
+		// Keep the reused session. Dropping the env here throws away the
+		// prior thread, which is worse than a stage running without a
+		// refreshed helper copy.
+		logger.Warn("execenv: refresh ARIS tools failed; continuing with the reused workdir", "error", err)
 	}
 
 	// Self-heal the root-level daemon marker on the reuse path too, so a marker
@@ -1074,6 +1102,93 @@ func hydrateCodexSkills(codexHome string, workspaceSkills []SkillContextForEnv, 
 		}
 	}
 	return ensureCodexDisabledSkillsConfig(filepath.Join(codexHome, "config.toml"), codexHome, disabledRuntimeSkills, workspaceSkills)
+}
+
+// materializeARISTools copies the vendored ARIS helper scripts into the
+// pipeline repository so skill lookup (.aris/tools, then $ARIS_REPO/tools)
+// succeeds without a separate installer. source is the tools directory
+// itself; an empty source is a no-op. The copy replaces .aris/tools and
+// rewrites the manifest repo_root to the tools directory's parent.
+func materializeARISTools(workDir, source string) error {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return nil
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("stat ARIS tools %s: %w", source, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("ARIS tools source %s is not a directory", source)
+	}
+	dest := filepath.Join(workDir, ".aris", "tools")
+	if err := os.RemoveAll(dest); err != nil {
+		return fmt.Errorf("clear %s: %w", dest, err)
+	}
+	if err := copyARISDir(source, dest); err != nil {
+		return err
+	}
+	manifest := "repo_root\t" + filepath.Dir(source) + "\n"
+	if err := os.WriteFile(filepath.Join(workDir, ".aris", "installed-skills.txt"), []byte(manifest), 0o644); err != nil {
+		return fmt.Errorf("write ARIS manifest: %w", err)
+	}
+	return nil
+}
+
+func copyARISDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			resolved := link
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(path), link)
+			}
+			inside, err := filepath.Rel(src, resolved)
+			if err != nil || !filepath.IsLocal(inside) {
+				return nil
+			}
+			return copyARISFile(resolved, target)
+		}
+		return copyARISFile(path, target)
+	})
+}
+
+func copyARISFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 // GCMetaKind identifies which kind of parent record a task workdir belongs to.

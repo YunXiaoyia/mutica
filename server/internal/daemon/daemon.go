@@ -8042,6 +8042,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}
 	}
 	envReused := false
+	reuseARISTools := ""
+	if localAssignment == nil && filepath.IsAbs(task.PipelineRepo) {
+		reuseARISTools = arisToolsSource()
+	}
 	priorClaim, priorWorkDir, lockedPriorInfo, reusable, reuseErr := d.lockReusablePriorEnvRoot(ctx, task, localAssignment, envClaim.RootDir())
 	if reuseErr != nil {
 		// Cancelled while waiting for the previous run to let go of its
@@ -8081,6 +8085,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			ReasonixEnv:           reasonixEnv,
 			CodexCustomArgs:       codexSandboxArgs,
 			Task:                  taskCtx,
+			ARISToolsSource:       reuseARISTools,
 		})
 		if err != nil {
 			return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("reuse execution environment: %w", err))
@@ -8202,6 +8207,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		} else {
 			if localAssignment != nil {
 				prepParams.LocalWorkDir = localAssignment.AbsPath
+			} else if filepath.IsAbs(task.PipelineRepo) {
+				prepParams.LocalWorkDir = task.PipelineRepo
+				prepParams.CreateLocalWorkDir = true
+				prepParams.ARISToolsSource = reuseARISTools
 			}
 			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
 			if err != nil {
@@ -8508,6 +8517,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		agentCustomEnv = task.Agent.CustomEnv
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
+	// Pipeline tasks resolve shared helpers through $ARIS_REPO/tools.
+	// An agent custom_env value wins; otherwise point at the vendored
+	// checkout (the parent of the materialized tools directory).
+	if filepath.IsAbs(task.PipelineRepo) && strings.TrimSpace(agentEnv["ARIS_REPO"]) == "" {
+		if tools := arisToolsSource(); tools != "" {
+			agentEnv["ARIS_REPO"] = filepath.Dir(tools)
+		}
+	}
 	if provider == "reasonix" {
 		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
 		if err != nil {
@@ -10264,6 +10281,34 @@ func taskTempBaseDir() (string, bool, error) {
 		return "", true, fmt.Errorf("MULTICA_AGENT_TEMP_BASE must be an absolute path, got %q", base)
 	}
 	return base, true, nil
+}
+
+// arisToolsSource is the vendored ARIS helper directory materialized into
+// each pipeline repository. MULTICA_ARIS_TOOLS overrides the default
+// checkout-relative path; a missing directory yields an empty string and
+// the task still runs, with skill scripts failing closed on lookup.
+func arisToolsSource() string {
+	if override := strings.TrimSpace(os.Getenv("MULTICA_ARIS_TOOLS")); override != "" {
+		if info, err := os.Stat(override); err == nil && info.IsDir() {
+			return override
+		}
+		return ""
+	}
+	self, err := resolveSelfExecutable()
+	if err != nil {
+		return ""
+	}
+	candidates := []string{
+		filepath.Join(filepath.Dir(self), "..", "..", "scripts", "aris", "tools"),
+		filepath.Join(filepath.Dir(self), "..", "scripts", "aris", "tools"),
+	}
+	for _, candidate := range candidates {
+		cleaned := filepath.Clean(candidate)
+		if info, err := os.Stat(cleaned); err == nil && info.IsDir() {
+			return cleaned
+		}
+	}
+	return ""
 }
 
 func socketSafeTempBaseDir() string {

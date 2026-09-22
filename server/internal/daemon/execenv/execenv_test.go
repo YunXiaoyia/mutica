@@ -6309,6 +6309,121 @@ func TestPrepareLocalWorkDir(t *testing.T) {
 	}
 }
 
+func TestPrepareCreateLocalWorkDir(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+
+	// When LocalWorkDir points to a non-existent directory and CreateLocalWorkDir is true,
+	// Prepare creates the directory and returns it as WorkDir.
+	createdDir := filepath.Join(t.TempDir(), "pipeline-repo-created")
+	env1, err := Prepare(PrepareParams{
+		WorkspacesRoot:     workspacesRoot,
+		WorkspaceID:        "ws-local",
+		TaskID:             "c1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		AgentName:          "Test Agent",
+		LocalWorkDir:       createdDir,
+		CreateLocalWorkDir: true,
+		Task: TaskContextForEnv{
+			IssueID: "issue-created",
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare with CreateLocalWorkDir=true failed: %v", err)
+	}
+	defer env1.Cleanup(true)
+
+	if env1.WorkDir != createdDir {
+		t.Fatalf("WorkDir = %q, want %q", env1.WorkDir, createdDir)
+	}
+	info, err := os.Stat(createdDir)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("expected createdDir to exist as a directory; info=%+v, err=%v", info, err)
+	}
+
+	// When CreateLocalWorkDir is false, behavior is identical to before the change.
+	workspacesRoot2 := t.TempDir()
+	defaultDir := filepath.Join(t.TempDir(), "pipeline-repo-default")
+	env2, err := Prepare(PrepareParams{
+		WorkspacesRoot:     workspacesRoot2,
+		WorkspaceID:        "ws-local",
+		TaskID:             "d1b2c3d4-e5f6-7890-abcd-000000000000",
+		AgentName:          "Test Agent",
+		LocalWorkDir:       defaultDir,
+		CreateLocalWorkDir: false,
+		Task: TaskContextForEnv{
+			IssueID: "issue-default",
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare with CreateLocalWorkDir=false failed: %v", err)
+	}
+	defer env2.Cleanup(true)
+
+	if env2.WorkDir != defaultDir {
+		t.Fatalf("WorkDir = %q, want %q", env2.WorkDir, defaultDir)
+	}
+}
+
+func TestPrepareMaterializesARISTools(t *testing.T) {
+	t.Parallel()
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "verify_papers.py"), []byte("print('ok')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(t.TempDir(), "paper")
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot:     t.TempDir(),
+		WorkspaceID:        "ws-local",
+		TaskID:             "e1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		AgentName:          "Experimenter",
+		LocalWorkDir:       workDir,
+		CreateLocalWorkDir: true,
+		ARISToolsSource:    source,
+		Task:               TaskContextForEnv{IssueID: "issue-aris"},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer env.Cleanup(true)
+
+	copied, err := os.ReadFile(filepath.Join(workDir, ".aris", "tools", "verify_papers.py"))
+	if err != nil {
+		t.Fatalf("helper was not materialized: %v", err)
+	}
+	if string(copied) != "print('ok')\n" {
+		t.Fatalf("helper contents = %q", copied)
+	}
+	manifest, err := os.ReadFile(filepath.Join(workDir, ".aris", "installed-skills.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "repo_root\t" + filepath.Dir(source) + "\n"
+	if string(manifest) != want {
+		t.Fatalf("manifest = %q, want %q", manifest, want)
+	}
+
+	// A reused pipeline workdir refreshes the helpers instead of keeping
+	// whatever the previous task copied.
+	updated := t.TempDir()
+	if err := os.WriteFile(filepath.Join(updated, "research_wiki.py"), []byte("print('wiki')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if reused := Reuse(ReuseParams{
+		WorkDir:         workDir,
+		ARISToolsSource: updated,
+		Task:            TaskContextForEnv{IssueID: "issue-aris"},
+	}, testLogger()); reused == nil {
+		t.Fatal("Reuse returned nil")
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".aris", "tools", "verify_papers.py")); !os.IsNotExist(err) {
+		t.Fatalf("stale helper survived refresh: %v", err)
+	}
+	wiki, err := os.ReadFile(filepath.Join(workDir, ".aris", "tools", "research_wiki.py"))
+	if err != nil || string(wiki) != "print('wiki')\n" {
+		t.Fatalf("refreshed helper = %q, err = %v", wiki, err)
+	}
+}
+
 func TestEnvironmentCleanupPreservesLocalDirectory(t *testing.T) {
 	t.Parallel()
 	workspacesRoot := t.TempDir()
