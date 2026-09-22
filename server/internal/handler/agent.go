@@ -420,6 +420,7 @@ type AgentTaskResponse struct {
 	CreatedAt            string                `json:"created_at"`
 	PriorSessionID       string                `json:"prior_session_id,omitempty"` // session ID from a previous task on same issue
 	PriorWorkDir         string                `json:"prior_work_dir,omitempty"`   // work_dir from a previous task on same issue
+	PipelineRepo         string                `json:"pipeline_repo,omitempty"`
 	// PriorSessionResumeUnavailable is set when a more recent Codex session was
 	// withheld because its rollout was missing (MUL-5305); PriorSessionID (if
 	// any) is then an older fallback, and the daemon surfaces the continuity gap

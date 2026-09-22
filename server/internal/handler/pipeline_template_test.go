@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -257,5 +258,134 @@ func TestPipelineInstantiate_OrchestratorReviewHoldsUntilAdvance(t *testing.T) {
 	}
 	if got := queuedTaskCount(t, fx.childIDs[2], fx.agentIDs[1]); got != 1 {
 		t.Fatalf("promoted review stage must run, got %d tasks", got)
+	}
+}
+
+func TestPipelineTemplate_RejectsSkillFromAnotherWorkspace(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	agentID := createHandlerTestAgent(t, "Pipeline Agent Skill Test", nil)
+	otherWS := dbfx.Workspace(t, "Other WS", fmt.Sprintf("other-%d", currentTimeNano()))
+	var otherSkillID string
+	dbfx.QueryRow(t, `
+		INSERT INTO skill (workspace_id, name, description, content, created_by)
+		VALUES ($1, $2, 'foreign skill', 'content', $3)
+		RETURNING id
+	`, otherWS, fmt.Sprintf("foreign-skill-%d", currentTimeNano()), testUserID).Scan(&otherSkillID)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM skill WHERE id = $1`, otherSkillID)
+		testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, otherWS)
+	})
+
+	templateName := fmt.Sprintf("foreign-skill-tpl-%d", currentTimeNano())
+	req := newRequest("POST", "/api/pipeline-templates", map[string]any{
+		"name":        templateName,
+		"description": "testing foreign skill rejection",
+		"stages": []map[string]any{
+			{
+				"stage_order":  1,
+				"name":         "stage-with-foreign-skill",
+				"agent_id":     agentID,
+				"skill_ids":    []string{otherSkillID},
+				"advance_mode": "auto",
+			},
+		},
+	})
+	testutil.Call(t, testHandler.CreatePipelineTemplate, req).Want(http.StatusBadRequest)
+
+	var count int
+	dbfx.QueryRow(t, `SELECT count(*) FROM pipeline_template WHERE name = $1`, templateName).Scan(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 leftover pipeline_template rows, got %d", count)
+	}
+}
+
+func TestPipelineTemplate_DeleteRemovesStagesFirst(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := createPipelineTemplate(t, "auto")
+	tplID := fx.tplID
+
+	delReq := withURLParam(newRequest("DELETE", "/api/pipeline-templates/"+tplID, nil), "id", tplID)
+	testutil.Call(t, testHandler.DeletePipelineTemplate, delReq).Want(http.StatusOK)
+
+	var stages int
+	dbfx.QueryRow(t, `SELECT count(*) FROM pipeline_template_stage WHERE template_id = $1`, tplID).Scan(&stages)
+	if stages != 0 {
+		t.Fatalf("expected 0 stages after delete, got %d", stages)
+	}
+	fx.tplID = "" // already deleted; skip fixture cleanup of template
+}
+
+func TestPipelineInstantiate_StampsRepoPath(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := createPipelineTemplate(t, "auto")
+	repoPath := "/workspace/work/paper-repo"
+	body := map[string]any{
+		"title":     "Paper Pipeline Run",
+		"repo_path": repoPath,
+	}
+	req := newRequest("POST", "/api/pipeline-templates/"+fx.tplID+"/instantiate", body)
+	req = withURLParam(req, "id", fx.tplID)
+	w := testutil.Call(t, testHandler.InstantiatePipelineTemplate, req).Want(http.StatusCreated)
+	var resp InstantiatePipelineResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	fx.rootID = resp.RootIssueID
+	for _, c := range resp.Children {
+		fx.childIDs = append(fx.childIDs, c.IssueID)
+	}
+
+	readMetaRepo := func(issueID string) string {
+		var raw []byte
+		dbfx.QueryRow(t, `SELECT metadata FROM issue WHERE id = $1`, issueID).Scan(&raw)
+		if len(raw) == 0 {
+			return ""
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("unmarshal metadata for %s: %v", issueID, err)
+		}
+		v, _ := m["pipeline_repo"].(string)
+		return v
+	}
+
+	if got := readMetaRepo(fx.rootID); got != repoPath {
+		t.Fatalf("expected root pipeline_repo %q, got %q", repoPath, got)
+	}
+	for _, childID := range fx.childIDs {
+		if got := readMetaRepo(childID); got != repoPath {
+			t.Fatalf("expected child %s pipeline_repo %q, got %q", childID, repoPath, got)
+		}
+		var desc string
+		dbfx.QueryRow(t, `SELECT description FROM issue WHERE id = $1`, childID).Scan(&desc)
+		expectedSnippet := "Shared repository: " + repoPath
+		if !strings.Contains(desc, expectedSnippet) {
+			t.Fatalf("expected child description to contain %q, got %q", expectedSnippet, desc)
+		}
+	}
+}
+
+func TestPipelineInstantiate_RejectsRelativeRepoPath(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := createPipelineTemplate(t, "auto")
+	uniqueTitle := fmt.Sprintf("rejected-pipeline-%d", currentTimeNano())
+	body := map[string]any{
+		"title":     uniqueTitle,
+		"repo_path": "relative/path",
+	}
+	req := newRequest("POST", "/api/pipeline-templates/"+fx.tplID+"/instantiate", body)
+	req = withURLParam(req, "id", fx.tplID)
+	testutil.Call(t, testHandler.InstantiatePipelineTemplate, req).Want(http.StatusBadRequest)
+
+	var count int
+	dbfx.QueryRow(t, `SELECT count(*) FROM issue WHERE title = $1`, uniqueTitle).Scan(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 issues with title %q, got %d", uniqueTitle, count)
 	}
 }

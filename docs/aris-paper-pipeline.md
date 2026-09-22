@@ -190,7 +190,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_dependency_depends_on_idx
 3. **派发**：不亲自执行任何阶段工作；阶段 agent 由模板指定。模板外的临时工作用 `multica issue create` + agent assignee（创建即触发）。
 4. **监督**：被父屏障或 chat bridge 唤醒时，拉取 `issue list --metadata pipeline_root=<id>` 与 `issue run-messages` 汇总进度，对照验收标准做复核判定；`auto` 阶段只播报不拦截，`orchestrator_review` 阶段复核通过才 `advance`。
 5. **请示**：阶段 `requires_human_gate=true`（默认：选题确认、大纲确认、终稿审）时，必须在聊天中给出结构化选项请用户拍板，用户回复（现有排队机制自动成为下一轮输入）后才继续。
-6. **异常**：收到 task.failed 播报时，按"重跑一次 → 仍失败则汇报用户"处理；需要裁剪范围时明确说"将取消 <issue>，其下游将带警告放行"。
+6. **异常**：收到 task.failed 播报时，自动重试不干预；终态且无在跑任务才 rerun 一次；第二次失败汇报用户（提供重跑、换方法、取消选项）；需要裁剪范围时明确说"将取消 <issue>，其下游将带警告放行"；绝不将失败阶段置 done。
 7. **收尾**：全部阶段终态后输出结项报告（产物清单、评审意见汇总、遗留项），父 issue 置 done，metadata `pipeline=completed`。
 8. **纪律**：单次唤醒内完成"汇总→决策→派发/请示"即停（对应 squad 协议 no-action 语义）；不在聊天里长篇转述 issue 全文，只给结论与链接。
 
@@ -264,7 +264,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_dependency_depends_on_idx
 
 - **进度面板**：主理人聊天即面板； issue 侧用保存的过滤器 `metadata pipeline_root=<id>`；不做新 UI（最终版不引入前端二开）。
 - **审计**：全部复用现有 task runs / autopilot runs / 事件流；bridge 播报含 issue ref 可回溯。
-- **恢复**：单任务失败 → `rerun`；阶段卡死（dependencies 长期未满足）→ 主理人监督播报中高亮；整个流水线重跑 → 以同模板重新 instantiate 新父 issue，旧链 metadata `pipeline=archived`。
+- **恢复**：单任务失败 → 自动重试不干预，终态且无在跑任务才 rerun 一次，二次失败请示用户；阶段卡死（dependencies 长期未满足）→ 主理人监督播报中高亮；整个流水线重跑 → 以同模板重新 instantiate 新父 issue，旧链 metadata `pipeline=archived`。
 - **清理**：结项时主理人执行固定清单（停监控 autopilot、归档 metadata、产物附件校验）。
 
 ## 11. 关键流程时序

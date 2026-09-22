@@ -105,29 +105,29 @@ func TestPipelineChatBridge_ReportsTaskOutcomeIntoChat(t *testing.T) {
 		Payload: map[string]any{"task_id": taskID},
 	})
 
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			var messages int
-			var content string
-			dbfx.QueryRow(t, `SELECT count(*) FROM chat_message WHERE chat_session_id = $1`, sessionID).Scan(&messages)
-			if messages > 0 {
-				dbfx.QueryRow(t, `SELECT content FROM chat_message WHERE chat_session_id = $1 LIMIT 1`, sessionID).Scan(&content)
-				if !strings.Contains(content, "pipeline report") {
-					t.Fatalf("bridge report must be the persisted message, got %q", content)
-				}
-				// The issue status rides along: the orchestrator needs the
-				// completed-task-but-issue-still-in_progress mismatch visible
-				// to rerun a stage instead of advancing the gate.
-				if !strings.Contains(content, "issue status:") {
-					t.Fatalf("bridge report must carry the issue status, got %q", content)
-				}
-				break
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var messages int
+		var content string
+		dbfx.QueryRow(t, `SELECT count(*) FROM chat_message WHERE chat_session_id = $1`, sessionID).Scan(&messages)
+		if messages > 0 {
+			dbfx.QueryRow(t, `SELECT content FROM chat_message WHERE chat_session_id = $1 LIMIT 1`, sessionID).Scan(&content)
+			if !strings.Contains(content, "pipeline report") {
+				t.Fatalf("bridge report must be the persisted message, got %q", content)
 			}
-			if time.Now().After(deadline) {
-				t.Fatal("bridge must report the task outcome into the orchestrator chat session")
+			// The issue status rides along: the orchestrator needs the
+			// completed-task-but-issue-still-in_progress mismatch visible
+			// to rerun a stage instead of advancing the gate.
+			if !strings.Contains(content, "issue status:") {
+				t.Fatalf("bridge report must carry the issue status, got %q", content)
 			}
-			time.Sleep(25 * time.Millisecond)
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("bridge must report the task outcome into the orchestrator chat session")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 
 	// The report enqueued an orchestrator turn.
 	var tasks int
@@ -175,5 +175,127 @@ func TestPipelineChatBridge_ReportsTaskOutcomeIntoChat(t *testing.T) {
 	dbfx.QueryRow(t, `SELECT count(*) FROM agent_task_queue WHERE chat_session_id = $1 AND status = 'queued'`, sessionID).Scan(&turns)
 	if turns != 1 {
 		t.Fatalf("unbound pipeline completions must not wake the orchestrator, got %d turns", turns)
+	}
+}
+
+func TestPipelineChatBridge_ReportsTaskFailedOutcomeIntoChat(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	previousWindow := PipelineReportCoalesceWindow
+	PipelineReportCoalesceWindow = 50 * time.Millisecond
+	t.Cleanup(func() { PipelineReportCoalesceWindow = previousWindow })
+
+	tests := []struct {
+		name         string
+		payloadExtra map[string]any
+		wantContains []string
+		dontContains []string
+	}{
+		{
+			name: "retry_pending",
+			payloadExtra: map[string]any{
+				"retry_pending":  true,
+				"failure_reason": "timeout",
+			},
+			wantContains: []string{
+				"pipeline report",
+				"issue status:",
+				"automatic retry is already queued",
+				"failure_reason: timeout",
+				"Do NOT rerun",
+			},
+		},
+		{
+			name: "terminal",
+			payloadExtra: map[string]any{
+				"retry_pending":  false,
+				"failure_reason": "agent_error",
+			},
+			wantContains: []string{
+				"pipeline report",
+				"issue status:",
+				"terminal",
+				"failure_reason: agent_error",
+			},
+			dontContains: []string{
+				"Do NOT rerun",
+			},
+		},
+		{
+			name:         "missing_fields",
+			payloadExtra: map[string]any{},
+			wantContains: []string{
+				"pipeline report",
+				"issue status:",
+				"failure_reason: unknown",
+			},
+			dontContains: []string{
+				"Do NOT rerun",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agentID := createHandlerTestAgent(t, "Bridge Failed Orchestrator "+tc.name, nil)
+			sessionID := dbfx.ChatSession(t, agentID)
+			t.Cleanup(func() {
+				testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE chat_session_id = $1`, sessionID)
+				testPool.Exec(ctx, `DELETE FROM chat_message WHERE chat_session_id = $1`, sessionID)
+			})
+
+			childID := dbfx.Issue(t, "Bridge failed stage issue "+tc.name)
+			dbfx.Exec(t, `
+				UPDATE issue SET metadata = metadata || jsonb_build_object('orchestrator_session', $2::text, 'pipeline_root', $3::text)
+				WHERE id = $1`, childID, sessionID, childID)
+			t.Cleanup(func() {
+				testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, childID)
+				testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, childID)
+			})
+
+			taskID := createHandlerTestTaskForAgentOnIssue(t, agentID, childID)
+
+			bus := events.New()
+			RegisterPipelineChatBridge(bus, testHandler.TaskService)
+
+			payload := map[string]any{
+				"task_id": taskID,
+			}
+			for k, v := range tc.payloadExtra {
+				payload[k] = v
+			}
+
+			bus.Publish(events.Event{
+				Type:    protocol.EventTaskFailed,
+				Payload: payload,
+			})
+
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var messages int
+				var content string
+				dbfx.QueryRow(t, `SELECT count(*) FROM chat_message WHERE chat_session_id = $1`, sessionID).Scan(&messages)
+				if messages > 0 {
+					dbfx.QueryRow(t, `SELECT content FROM chat_message WHERE chat_session_id = $1 LIMIT 1`, sessionID).Scan(&content)
+					for _, want := range tc.wantContains {
+						if !strings.Contains(content, want) {
+							t.Fatalf("expected report to contain %q, got %q", want, content)
+						}
+					}
+					for _, dont := range tc.dontContains {
+						if strings.Contains(content, dont) {
+							t.Fatalf("expected report NOT to contain %q, got %q", dont, content)
+						}
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("bridge must report the task outcome into the orchestrator chat session")
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+		})
 	}
 }

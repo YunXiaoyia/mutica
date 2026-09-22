@@ -90,17 +90,42 @@ func (b *pipelineChatBridge) onTaskEvent(e events.Event) {
 		return
 	}
 
-	outcome := "completed"
-	if e.Type == protocol.EventTaskFailed {
-		outcome = "FAILED"
-	}
 	// The issue status rides along on purpose: an agent can end its task
 	// without moving the issue to a terminal state (models occasionally
 	// narrate a finish and exit). The orchestrator must see that mismatch to
 	// rerun the stage instead of advancing the gate.
+	var detail string
+	if e.Type == protocol.EventTaskFailed {
+		var retryPending bool
+		if v, ok := payload["retry_pending"].(bool); ok {
+			retryPending = v
+		}
+		var failureReason string
+		if v, ok := payload["failure_reason"].(string); ok {
+			failureReason = strings.TrimSpace(v)
+		}
+		if failureReason == "" {
+			failureReason = "unknown"
+		}
+
+		if retryPending {
+			detail = fmt.Sprintf(
+				"has FAILED but an automatic retry is already queued (failure_reason: %s, issue status: %s). Do NOT rerun this issue; wait for the retry.",
+				failureReason, issue.Status)
+		} else {
+			detail = fmt.Sprintf(
+				"has FAILED and is terminal (failure_reason: %s, issue status: %s).",
+				failureReason, issue.Status)
+		}
+	} else {
+		detail = fmt.Sprintf(
+			"has completed (issue status: %s). Check `multica issue list --metadata pipeline_root=%s` for the full plan and continue the pipeline.",
+			issue.Status, b.pipelineRootOf(issue))
+	}
+
 	b.queue(sessionID, fmt.Sprintf(
-		"[pipeline report] The task on issue %s — %q — has %s (issue status: %s). Check `multica issue list --metadata pipeline_root=%s` for the full plan and continue the pipeline.",
-		uuidToString(issue.ID), issue.Title, outcome, issue.Status, b.pipelineRootOf(issue)))
+		"[pipeline report] The task on issue %s — %q — %s",
+		uuidToString(issue.ID), issue.Title, detail))
 }
 
 // orchestratorSessionFor resolves the bound chat session: the issue's own

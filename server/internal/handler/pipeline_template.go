@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -184,7 +185,29 @@ func (h *Handler) stageSkillIDs(raw []string) ([]pgtype.UUID, error) {
 	return skillIDs, nil
 }
 
-func (h *Handler) insertTemplateStage(ctx context.Context, templateID pgtype.UUID, s PipelineTemplateStageRequest, agentID pgtype.UUID) error {
+var errSkillNotInWorkspace = errors.New("stage skill does not exist in this workspace")
+
+// stageSkillsInWorkspace checks that every skill id is a UUID belonging to the
+// workspace. Callers that replace a stored plan must run this before deleting
+// the current rows: a rejection after the delete would leave the template with
+// no stages, and there is no foreign key to roll that back.
+func (h *Handler) stageSkillsInWorkspace(ctx context.Context, wsUUID pgtype.UUID, raw []string) error {
+	skillIDs, err := h.stageSkillIDs(raw)
+	if err != nil {
+		return err
+	}
+	for _, skillID := range skillIDs {
+		if _, err := h.Queries.GetSkillInWorkspace(ctx, db.GetSkillInWorkspaceParams{ID: skillID, WorkspaceID: wsUUID}); err != nil {
+			return errSkillNotInWorkspace
+		}
+	}
+	return nil
+}
+
+func (h *Handler) insertTemplateStage(ctx context.Context, wsUUID, templateID pgtype.UUID, s PipelineTemplateStageRequest, agentID pgtype.UUID) error {
+	if err := h.stageSkillsInWorkspace(ctx, wsUUID, s.SkillIDs); err != nil {
+		return err
+	}
 	skillIDs, err := h.stageSkillIDs(s.SkillIDs)
 	if err != nil {
 		return err
@@ -328,10 +351,14 @@ func (h *Handler) CreatePipelineTemplate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	for i, s := range req.Stages {
-		if err := h.insertTemplateStage(r.Context(), tpl.ID, s, agentIDs[i]); err != nil {
+		if err := h.insertTemplateStage(r.Context(), wsUUID, tpl.ID, s, agentIDs[i]); err != nil {
 			// App-level cleanup (no FKs): drop the half-built template.
 			h.Queries.DeletePipelineTemplateStages(r.Context(), tpl.ID)
 			h.Queries.DeletePipelineTemplate(r.Context(), db.DeletePipelineTemplateParams{ID: tpl.ID, WorkspaceID: wsUUID})
+			if errors.Is(err, errSkillNotInWorkspace) {
+				writeError(w, http.StatusBadRequest, "stage skill does not exist in this workspace")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to store pipeline template stage")
 			return
 		}
@@ -397,12 +424,24 @@ func (h *Handler) UpdatePipelineTemplate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if replaceStages {
+		// Reject a plan that names a missing skill before deleting the
+		// current stages, so a 400 leaves the stored plan untouched.
+		for _, s := range req.Stages {
+			if err := h.stageSkillsInWorkspace(r.Context(), wsUUID, s.SkillIDs); err != nil {
+				if errors.Is(err, errSkillNotInWorkspace) {
+					writeError(w, http.StatusBadRequest, "stage skill does not exist in this workspace")
+					return
+				}
+				writeError(w, http.StatusBadRequest, "stage skill_ids must be UUIDs")
+				return
+			}
+		}
 		if err := h.Queries.DeletePipelineTemplateStages(r.Context(), tpl.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to replace pipeline template stages")
 			return
 		}
 		for i, s := range req.Stages {
-			if err := h.insertTemplateStage(r.Context(), tpl.ID, s, agentIDs[i]); err != nil {
+			if err := h.insertTemplateStage(r.Context(), wsUUID, tpl.ID, s, agentIDs[i]); err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to store pipeline template stage")
 				return
 			}
@@ -429,11 +468,14 @@ func (h *Handler) DeletePipelineTemplate(w http.ResponseWriter, r *http.Request)
 	if !parseOK {
 		return
 	}
+	if err := h.Queries.DeletePipelineTemplateStages(r.Context(), tplID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete pipeline template stages")
+		return
+	}
 	if _, err := h.Queries.DeletePipelineTemplate(r.Context(), db.DeletePipelineTemplateParams{ID: tplID, WorkspaceID: wsUUID}); err != nil {
 		writeError(w, http.StatusNotFound, "pipeline template not found")
 		return
 	}
-	h.Queries.DeletePipelineTemplateStages(r.Context(), tplID)
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
@@ -445,6 +487,7 @@ type InstantiatePipelineTemplateRequest struct {
 	// chat session; the chat bridge (WP-3) reads it from the parent metadata
 	// to report stage completions back into the conversation.
 	OrchestratorSessionID string `json:"orchestrator_session_id"`
+	RepoPath              string `json:"repo_path"`
 }
 
 // PipelineRunChildResponse is one instantiated stage child.
@@ -495,6 +538,25 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	var cleanedRepoPath string
+	if req.RepoPath != "" {
+		if !filepath.IsAbs(req.RepoPath) {
+			writeError(w, http.StatusBadRequest, "repo_path must be an absolute directory path")
+			return
+		}
+		cleaned := filepath.Clean(req.RepoPath)
+		if cleaned == "/" {
+			writeError(w, http.StatusBadRequest, "repo_path must be an absolute directory path")
+			return
+		}
+		for _, part := range strings.Split(filepath.ToSlash(cleaned), "/") {
+			if part == ".." {
+				writeError(w, http.StatusBadRequest, "repo_path must be an absolute directory path")
+				return
+			}
+		}
+		cleanedRepoPath = cleaned
 	}
 	var sessionID pgtype.UUID
 	if req.OrchestratorSessionID != "" {
@@ -576,21 +638,47 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 		// rows cascade with the legacy issue FK). Best-effort: the request has
 		// already failed, so a leftover row is a cleanup complaint, not a
 		// second failure.
-		for _, issue := range created {
-			h.Queries.DeleteIssue(r.Context(), db.DeleteIssueParams{ID: issue.ID, WorkspaceID: issue.WorkspaceID})
+		for i := len(created) - 1; i >= 0; i-- {
+			issue := created[i]
+			if err := h.Queries.DeleteIssue(r.Context(), db.DeleteIssueParams{ID: issue.ID, WorkspaceID: issue.WorkspaceID}); err != nil {
+				slog.Warn("instantiate cleanup: delete issue failed", "error", err, "issue_id", uuidToString(issue.ID))
+			}
 		}
 	}
 
-	setMeta := func(issueID pgtype.UUID, key, value string) {
-		encoded, _ := json.Marshal(value)
-		h.Queries.SetIssueMetadataKey(r.Context(), db.SetIssueMetadataKeyParams{
+	setMeta := func(issueID pgtype.UUID, key, value string) error {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		_, err = h.Queries.SetIssueMetadataKey(r.Context(), db.SetIssueMetadataKeyParams{
 			Key: key, Value: encoded, ID: issueID, WorkspaceID: wsUUID,
 		})
+		return err
 	}
-	setMeta(parent.Issue.ID, "pipeline", "active")
-	setMeta(parent.Issue.ID, "pipeline_template", fmt.Sprintf("%s:v%d", tpl.Name, tpl.Version))
+	if err := setMeta(parent.Issue.ID, "pipeline", "active"); err != nil {
+		cleanupFailedInstantiation()
+		writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+		return
+	}
+	if err := setMeta(parent.Issue.ID, "pipeline_template", fmt.Sprintf("%s:v%d", tpl.Name, tpl.Version)); err != nil {
+		cleanupFailedInstantiation()
+		writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+		return
+	}
+	if cleanedRepoPath != "" {
+		if err := setMeta(parent.Issue.ID, "pipeline_repo", cleanedRepoPath); err != nil {
+			cleanupFailedInstantiation()
+			writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+			return
+		}
+	}
 	if sessionID.Valid {
-		setMeta(parent.Issue.ID, "orchestrator_session", uuidToString(sessionID))
+		if err := setMeta(parent.Issue.ID, "orchestrator_session", uuidToString(sessionID)); err != nil {
+			cleanupFailedInstantiation()
+			writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+			return
+		}
 	}
 
 	// Phase A: every child is born in backlog — parked, so neither the
@@ -601,6 +689,12 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 		childDescription := interpolateStagePrompt(st.PromptTemplate, req.Title, req.Description)
 		if st.AcceptanceCriteria != "" {
 			childDescription += "\n\n## Acceptance criteria\n" + st.AcceptanceCriteria
+		}
+		if cleanedRepoPath != "" {
+			if childDescription != "" {
+				childDescription += "\n\n"
+			}
+			childDescription += fmt.Sprintf("Shared repository: %s\nWrite every deliverable inside that repository and commit it. Do not leave artifacts in the task's temporary work directory.", cleanedRepoPath)
 		}
 		child, err := h.IssueService.Create(r.Context(), service.IssueCreateParams{
 			WorkspaceID:   wsUUID,
@@ -624,14 +718,41 @@ func (h *Handler) InstantiatePipelineTemplate(w http.ResponseWriter, r *http.Req
 			return
 		}
 		created = append(created, &child.Issue)
-		setMeta(child.Issue.ID, "pipeline_root", uuidToString(parent.Issue.ID))
-		if sessionID.Valid {
-			setMeta(child.Issue.ID, "orchestrator_session", uuidToString(sessionID))
+		if err := setMeta(child.Issue.ID, "pipeline_root", uuidToString(parent.Issue.ID)); err != nil {
+			cleanupFailedInstantiation()
+			writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+			return
 		}
-		setMeta(child.Issue.ID, "pipeline_stage_name", st.Name)
-		setMeta(child.Issue.ID, "advance_mode", st.AdvanceMode)
+		if cleanedRepoPath != "" {
+			if err := setMeta(child.Issue.ID, "pipeline_repo", cleanedRepoPath); err != nil {
+				cleanupFailedInstantiation()
+				writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+				return
+			}
+		}
+		if sessionID.Valid {
+			if err := setMeta(child.Issue.ID, "orchestrator_session", uuidToString(sessionID)); err != nil {
+				cleanupFailedInstantiation()
+				writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+				return
+			}
+		}
+		if err := setMeta(child.Issue.ID, "pipeline_stage_name", st.Name); err != nil {
+			cleanupFailedInstantiation()
+			writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+			return
+		}
+		if err := setMeta(child.Issue.ID, "advance_mode", st.AdvanceMode); err != nil {
+			cleanupFailedInstantiation()
+			writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+			return
+		}
 		if st.RequiresHumanGate {
-			setMeta(child.Issue.ID, "human_gate", "true")
+			if err := setMeta(child.Issue.ID, "human_gate", "true"); err != nil {
+				cleanupFailedInstantiation()
+				writeError(w, http.StatusInternalServerError, "failed to stamp pipeline metadata")
+				return
+			}
 		}
 		childrenByStage[st.StageOrder] = append(childrenByStage[st.StageOrder], child.Issue)
 		childResponses = append(childResponses, PipelineRunChildResponse{
