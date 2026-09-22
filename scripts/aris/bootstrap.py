@@ -7,13 +7,14 @@ One idempotent command that brings a fresh workspace to the full lineup:
 2. Sync the ARIS skills (delegates to sync_skills.py).
 3. Bind the skills per the roster.
 4. Create the default pipeline template (paper-default) if absent.
-5. Create the orchestrator's chat session and print its id — this is the
+5. Create the experiment monitoring autopilot (experiment-monitor) if absent.
+6. Create the orchestrator's chat session and print its id — this is the
    主理人窗口 the user talks to.
 
 Usage:
-    MULTICA_BASE_URL=http://localhost:18516 \\
-    MULTICA_PAT=mul_... \\
-    MULTICA_WORKSPACE_ID=<uuid> \\
+    MULTICA_BASE_URL=http://localhost:18516 \
+    MULTICA_PAT=mul_... \
+    MULTICA_WORKSPACE_ID=<uuid> \
     python3 scripts/aris/bootstrap.py
 
 The roster below is the single source of truth for agents and bindings.
@@ -23,6 +24,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -44,58 +47,84 @@ ROSTER = {
     ),
     "Scout": (
         "选题与新颖性把关。",
-        "You propose and validate paper topics. Follow the idea-discovery and "
-        "novelty-check skills, with alphaxiv for arxiv-wide signal scanning. "
-        "Output: a ranked shortlist with evidence, then stop.",
-        ["idea-discovery", "novelty-check", "alphaxiv", "shared-references"],
+        "You propose and validate paper topics. Follow idea-discovery, then "
+        "novelty-check and research-review before ranking. Use alphaxiv for "
+        "arxiv-wide signal. Output: a ranked shortlist with evidence, then stop.",
+        ["idea-discovery", "idea-creator", "novelty-check", "research-review",
+         "research-refine", "alphaxiv", "shared-references"],
     ),
     "Researcher": (
         "文献综述。",
-        "You run literature review. Follow the research-lit and arxiv skills, "
-        "with deepxiv and comm-lit-review for deep reading and "
-        "community-discussion grounding. Output: a structured related-work map "
-        "with citations, then stop.",
-        ["research-lit", "arxiv", "deepxiv", "comm-lit-review", "shared-references"],
+        "You run literature review. Follow research-lit, and use arxiv, "
+        "semantic-scholar, openalex, deepxiv and comm-lit-review for sources. "
+        "Verify citations with the vendored tools/verify_papers.py resolved via "
+        ".aris/tools or $ARIS_REPO. Record papers in the research wiki when "
+        "research-wiki/ exists. Output: a structured related-work map with "
+        "citations, then stop.",
+        ["research-lit", "arxiv", "semantic-scholar", "openalex", "deepxiv",
+         "exa-search", "comm-lit-review", "research-wiki", "shared-references"],
     ),
     "Planner": (
         "实验设计。",
-        "You design experiments. Follow the experiment-plan and "
-        "ablation-planner skills. Output: an executable experiment plan with "
-        "datasets, metrics, controls, and compute estimates, then stop.",
-        ["experiment-plan", "ablation-planner", "shared-references"],
+        "You design experiments. Follow experiment-plan and experiment-bridge, "
+        "with ablation-planner for controls. Output: an executable plan with "
+        "datasets, metrics, baselines, ablations and compute estimates, then stop.",
+        ["experiment-plan", "experiment-bridge", "ablation-planner",
+         "formula-derivation", "shared-references"],
     ),
     "Experimenter": (
         "跑实验（submit-and-poll：提交集群作业后记录 job id 即停）。",
-        "You execute experiments on the cluster using the run-experiment skill "
-        "in submit-and-poll mode: submit the job, write cluster_job and "
-        "cluster_status into the issue metadata, and END YOUR RUN. You will be "
-        "woken again to poll. Never block a task waiting for training to "
-        "finish.",
-        ["run-experiment", "monitor-experiment", "experiment-monitor-poll", "shared-references"],
+        "You execute experiments with run-experiment in submit-and-poll mode and "
+        "experiment-queue for remote GPU jobs. Submit the job, write cluster_job "
+        "and cluster_status into the issue metadata, and END YOUR RUN. You will "
+        "be woken to poll. Never block a task waiting for training. Shared "
+        "helpers resolve from .aris/tools, then $ARIS_REPO/tools.",
+        ["run-experiment", "monitor-experiment", "experiment-monitor-poll",
+         "experiment-queue", "training-check", "qzcli", "shared-references"],
     ),
     "Analyst": (
         "结果分析与结论。",
-        "You analyze experiment results using the analyze-results and "
-        "result-to-claim skills. Output: claims each anchored to artifacts, "
-        "then stop.",
-        ["analyze-results", "result-to-claim", "shared-references"],
+        "You analyze experiment results using analyze-results, experiment-audit "
+        "and result-to-claim. Output: claims each anchored to an artifact, then stop.",
+        ["analyze-results", "experiment-audit", "result-to-claim", "shared-references"],
     ),
     "Writer": (
         "成文与图表。",
-        "You write and compile the paper using the paper-write, paper-figure "
-        "and paper-compile skills, with citation-audit for reference integrity "
-        "and claims-drafting for contribution statements. Keep the paper in the "
-        "shared git repo; commit per revision. Output: updated repo + compile "
-        "status, then stop.",
-        ["paper-write", "paper-figure", "paper-compile", "citation-audit",
-         "claims-drafting", "shared-references"],
+        "You write the paper with paper-writing (plan, draft, figures, compile). "
+        "Run citation-audit and paper-claim-audit before you stop, and "
+        "integrity-forensics when the issue metadata human_gate is true or the "
+        "paper assurance file says submission. Keep the paper in the shared git "
+        "repo and commit per revision. Output: repo path plus compile status, then stop.",
+        ["paper-writing", "paper-plan", "paper-write", "paper-figure",
+         "paper-compile", "citation-audit", "paper-claim-audit",
+         "integrity-forensics", "auto-paper-improvement-loop", "shared-references"],
     ),
     "Reviewer": (
-        "内审与修订意见。",
-        "You internal-review the draft using the auto-review-loop and rebuttal "
-        "skills. Output: numbered, actionable findings with severity, then stop.",
-        ["auto-review-loop", "rebuttal", "shared-references"],
+        "独立模型内审。执行者与评审者必须是不同模型族。",
+        "You review with auto-review-loop-llm, not by scoring your own draft. "
+        "Call the llm-chat MCP tool (mcp__llm-chat__chat) or, if that tool is "
+        "absent, the curl fallback in the skill using LLM_BASE_URL, LLM_API_KEY "
+        "and LLM_MODEL from the environment. Those must name a model family "
+        "different from the executor. Also run rebuttal and kill-argument when "
+        "the draft is near a venue. Output: numbered findings with severity, "
+        "each tied to a file path, then stop.",
+        ["auto-review-loop-llm", "auto-review-loop", "rebuttal", "kill-argument",
+         "proof-checker", "shared-references"],
     ),
+}
+
+# Skills attached to the stage issue itself, in addition to the agent binding.
+# The agent binding is what the daemon materialises; these ids are the
+# stage contract a template editor can see.
+STAGE_SKILLS = {
+    1: ["idea-discovery", "novelty-check", "research-review"],
+    2: ["research-lit", "arxiv", "semantic-scholar", "research-wiki"],
+    3: ["experiment-plan", "experiment-bridge", "ablation-planner"],
+    4: ["run-experiment", "monitor-experiment", "experiment-monitor-poll", "experiment-queue"],
+    5: ["analyze-results", "result-to-claim", "experiment-audit"],
+    6: ["paper-writing", "paper-plan", "paper-write", "citation-audit", "paper-claim-audit"],
+    7: ["auto-review-loop-llm", "rebuttal", "kill-argument"],
+    8: ["paper-write", "paper-compile", "integrity-forensics", "auto-paper-improvement-loop"],
 }
 
 TEMPLATE_STAGES = [
@@ -146,6 +175,34 @@ def request(method: str, path: str, body: dict | None = None) -> dict | list:
         raise SystemExit(f"{method} {path} -> {e.code}: {e.read().decode(errors='replace')[:500]}") from e
 
 
+def reviewer_runtime() -> tuple[dict, dict[str, str]]:
+    """Cross-model reviewer: llm-chat MCP plus the curl fallback env.
+
+    LLM_API_KEY / LLM_BASE_URL / LLM_MODEL come from the process environment
+    and are never written into the repo. When the key is absent the MCP server
+    is still registered so the tool exists; the skill's curl path then fails
+    closed instead of the reviewer scoring its own draft.
+    """
+    root = Path(__file__).resolve().parent
+    server = root / "mcp-servers" / "llm-chat" / "server.py"
+    python = shutil.which("python3") or "python3"
+    llm_env = {
+        "LLM_API_KEY": os.environ.get("LLM_API_KEY", ""),
+        "LLM_BASE_URL": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+        "LLM_MODEL": os.environ.get("LLM_MODEL", "deepseek-chat"),
+    }
+    mcp = {
+        "mcpServers": {
+            "llm-chat": {
+                "command": python,
+                "args": [str(server)],
+                "env": llm_env,
+            }
+        }
+    }
+    return mcp, llm_env
+
+
 def resolve_runtime_id(request_fn) -> str:
     """Pick the runtime agents run on. MULTICA_RUNTIME_ID pins it explicitly —
     recommended for the orchestrator, whose chat session resume only works on
@@ -170,10 +227,13 @@ def main() -> int:
 
     api = API(os.environ["MULTICA_BASE_URL"], os.environ["MULTICA_PAT"], os.environ["MULTICA_WORKSPACE_ID"])
     runtime_id = resolve_runtime_id(request)
+    reviewer_mcp, reviewer_env = reviewer_runtime()
+    if not reviewer_env["LLM_API_KEY"]:
+        print("  warning: LLM_API_KEY is empty; Reviewer will not be able to call a second model family")
 
     # 1. Skills first: agents bind by id.
     print("== syncing skills ==")
-    os.system(f"{sys.executable} {Path(__file__).parent / 'sync_skills.py'}")
+    subprocess.run([sys.executable, str(Path(__file__).parent / "sync_skills.py")], check=True)
     skill_index = {s["name"]: s["id"] for s in api.list_skills()}
 
     # 2. Agents (idempotent by name).
@@ -191,13 +251,17 @@ def main() -> int:
             })
             print(f"  updated agent {name}")
         else:
-            created = request("POST", "/api/agents", {
+            body = {
                 "name": name,
                 "description": description,
                 "instructions": instructions,
                 "runtime_id": runtime_id,
                 "visibility": "workspace",
-            })
+            }
+            if name == "Reviewer":
+                body["mcp_config"] = reviewer_mcp
+                body["custom_env"] = reviewer_env
+            created = request("POST", "/api/agents", body)
             agent_ids[name] = created["id"]
             print(f"  created agent {name}")
 
@@ -208,6 +272,13 @@ def main() -> int:
         if ids:
             request("PUT", f"/api/agents/{agent_ids[name]}/skills", {"skill_ids": ids})
             print(f"  {name}: {len(ids)} skill(s)")
+
+    # Reviewer MCP is safe to refresh: it holds no secret beyond what custom_env
+    # already carries, and PUT /api/agents accepts mcp_config. custom_env is
+    # write-once on create (updates go through /env and replace the whole map),
+    # so an existing Reviewer keeps whatever key the operator already stored.
+    request("PUT", f"/api/agents/{agent_ids['Reviewer']}", {"mcp_config": reviewer_mcp})
+    print("  Reviewer: llm-chat MCP registered")
 
     # 4. Default template (idempotent by name+version).
     print("== pipeline template ==") # updated
@@ -222,6 +293,7 @@ def main() -> int:
             "requires_human_gate": s["requires_human_gate"],
             "prompt_template": s["prompt_template"],
             "acceptance_criteria": s["acceptance_criteria"],
+            "skill_ids": [skill_index[n] for n in STAGE_SKILLS.get(s["stage_order"], []) if n in skill_index],
         }
         for s in TEMPLATE_STAGES
     ]
@@ -241,7 +313,65 @@ def main() -> int:
         })
         print("  created paper-default")
 
-    # 5. Orchestrator chat session (the 主理人窗口).
+    # 5. Experiment monitoring autopilot (idempotent by title).
+    print("== experiment-monitor autopilot ==")
+    autopilots_resp = request("GET", "/api/autopilots")
+    existing_autopilots = (
+        autopilots_resp.get("autopilots", [])
+        if isinstance(autopilots_resp, dict)
+        else autopilots_resp
+    )
+    existing_ap = next(
+        (a for a in existing_autopilots if isinstance(a, dict) and a.get("title") == "experiment-monitor"),
+        None,
+    )
+
+    if existing_ap:
+        autopilot_id = existing_ap["id"]
+        print(f"  reusing autopilot {autopilot_id}")
+    else:
+        created_ap = request("POST", "/api/autopilots", {
+            "title": "experiment-monitor",
+            "assignee_id": agent_ids["Experimenter"],
+            "execution_mode": "run_only",
+            "description": (
+                "Run the experiment-monitor-poll skill. List issues with `multica issue list --metadata cluster_status=submitted` "
+                "and again with `cluster_status=running`. For each issue, first run `multica issue runs <issue-id> --active`; "
+                "if any run is queued, dispatched, running, or waiting_local_directory, skip that issue. Otherwise poll the cluster job "
+                "recorded in the issue metadata, update cluster_status, and on genuine completion set the issue to done so the dependency "
+                "gate releases the next stage. Never mark a failed job done. One check per run — do not sleep or poll inside this run. "
+                "If a previous poll is still running, exit immediately."
+            ),
+        })
+        if not isinstance(created_ap, dict) or not created_ap.get("id"):
+            raise SystemExit(f"POST /api/autopilots returned no id: {created_ap!r}"[:300])
+        autopilot_id = created_ap["id"]
+        print(f"  created autopilot {autopilot_id}")
+
+    # GET /api/autopilots/{id} wraps the row: {"autopilot": {...}, "triggers": [...]}.
+    # The list endpoint is the flat one; reading triggers off the wrong level would
+    # always see none and create a new schedule on every rerun.
+    ap_detail = request("GET", f"/api/autopilots/{autopilot_id}")
+    triggers = ap_detail.get("triggers", []) if isinstance(ap_detail, dict) else []
+    has_schedule = any(
+        isinstance(t, dict)
+        and t.get("kind") == "schedule"
+        and t.get("cron_expression") == "*/15 * * * *"
+        for t in triggers
+    )
+    if not has_schedule:
+        request("POST", f"/api/autopilots/{autopilot_id}/triggers", {
+            "kind": "schedule",
+            "cron_expression": "*/15 * * * *",
+            "timezone": "Asia/Shanghai",
+        })
+        print("  created schedule trigger")
+    else:
+        print("  reusing schedule trigger")
+
+    print(f"experiment-monitor autopilot: {autopilot_id}")
+
+    # 6. Orchestrator chat session (the 主理人窗口).
     print("== orchestrator chat session ==")
     sessions = request("GET", "/api/chat/sessions")
     existing = next((s for s in sessions if s.get("agent_id") == agent_ids["Aris"] and s.get("status") == "active"), None)
@@ -253,7 +383,11 @@ def main() -> int:
         session_id = created["id"] if isinstance(created, dict) else created
         print(f"  created session {session_id}")
 
-    print(json.dumps({"ok": True, "orchestrator_session_id": session_id}, ensure_ascii=False, indent=2))
+    print(json.dumps({
+        "ok": True,
+        "orchestrator_session_id": session_id,
+        "experiment_monitor_autopilot_id": autopilot_id,
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
