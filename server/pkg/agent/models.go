@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2450,7 +2451,12 @@ func discoverGrokModels(ctx context.Context, runtimeCmd Command) (Catalog, error
 		acpArgs:      []string{"--no-auto-update", "agent", "--always-approve", "stdio"},
 		annotate:     annotateGrokThinkingFromACP,
 		selectAuthMethod: func(initResult json.RawMessage, childEnv []string) (string, error) {
-			return selectGrokAuthMethod(extractACPAuthMethods(initResult), envHasNonEmpty(childEnv, "XAI_API_KEY"))
+			methods := extractACPAuthMethods(initResult)
+			haveKey := envHasNonEmpty(childEnv, "XAI_API_KEY")
+			if !haveKey && !slices.Contains(methods, grokAuthMethodCachedToken) {
+				haveKey = grokResolveAPIKey(childEnv, "") != ""
+			}
+			return selectGrokAuthMethod(methods, haveKey)
 		},
 		strictErrors: true,
 	})

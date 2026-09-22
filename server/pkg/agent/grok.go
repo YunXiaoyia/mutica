@@ -4,12 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 // grokBlockedArgs are flags/subcommands hardcoded by the daemon that must not
@@ -296,7 +301,12 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		// documented preference is the API key when XAI_API_KEY is set and
 		// offered, otherwise the cached login token.
 		// Ref: https://docs.x.ai/build/cli/headless-scripting
-		methodID, err := selectGrokAuthMethod(extractACPAuthMethods(initResult), envHasNonEmpty(childEnv, "XAI_API_KEY"))
+		methods := extractACPAuthMethods(initResult)
+		haveKey := envHasNonEmpty(childEnv, "XAI_API_KEY")
+		if !haveKey && !slices.Contains(methods, grokAuthMethodCachedToken) {
+			haveKey = grokResolveAPIKey(childEnv, opts.Model) != ""
+		}
+		methodID, err := selectGrokAuthMethod(methods, haveKey)
 		if err != nil {
 			finalStatus = "failed"
 			finalError = fmt.Sprintf("grok authentication setup failed: %v", err)
@@ -595,4 +605,109 @@ func envHasNonEmpty(env []string, key string) bool {
 		}
 	}
 	return false
+}
+
+func envLookup(env []string, key string) (string, bool) {
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return env[i][len(prefix):], true
+		}
+	}
+	return "", false
+}
+
+type grokConfigFile struct {
+	APIKey string `toml:"api_key"`
+	EnvKey string `toml:"env_key"`
+	Models struct {
+		Default string `toml:"default"`
+	} `toml:"models"`
+	Model map[string]struct {
+		APIKey string `toml:"api_key"`
+		EnvKey string `toml:"env_key"`
+	} `toml:"model"`
+}
+
+func grokConfigSearchPaths() []string {
+	var paths []string
+	if dir := os.Getenv("GROK_CONFIG_DIR"); dir != "" {
+		paths = append(paths, filepath.Join(dir, "config.toml"))
+	}
+	if home := os.Getenv("GROK_HOME"); home != "" {
+		paths = append(paths, filepath.Join(home, "config.toml"))
+	}
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		paths = append(paths, filepath.Join(xdg, "grok", "config.toml"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		paths = append(paths, filepath.Join(home, ".grok", "config.toml"))
+		paths = append(paths, filepath.Join(home, ".config", "grok", "config.toml"))
+	}
+	return paths
+}
+
+func resolveGrokKey(apiKey, envKey string) string {
+	if k := strings.TrimSpace(apiKey); k != "" {
+		return k
+	}
+	if envName := strings.TrimSpace(envKey); envName != "" {
+		if val := strings.TrimSpace(os.Getenv(envName)); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+// grokConfigAPIKey attempts to read an api_key or resolved env_key from Grok's config.toml.
+func grokConfigAPIKey(model string) string {
+	for _, path := range grokConfigSearchPaths() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cfg grokConfigFile
+		if err := toml.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		if model != "" && cfg.Model != nil {
+			if m, ok := cfg.Model[model]; ok {
+				if key := resolveGrokKey(m.APIKey, m.EnvKey); key != "" {
+					return key
+				}
+			}
+		}
+		if cfg.Models.Default != "" && cfg.Model != nil {
+			if m, ok := cfg.Model[cfg.Models.Default]; ok {
+				if key := resolveGrokKey(m.APIKey, m.EnvKey); key != "" {
+					return key
+				}
+			}
+		}
+		if cfg.Model != nil {
+			for _, m := range cfg.Model {
+				if key := resolveGrokKey(m.APIKey, m.EnvKey); key != "" {
+					return key
+				}
+			}
+		}
+		if key := resolveGrokKey(cfg.APIKey, cfg.EnvKey); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+// grokResolveAPIKey looks for an API key in childEnv first, then in the process
+// environment, and finally in Grok's config.toml (~/.grok/config.toml, etc.).
+// If childEnv explicitly defines an empty key (e.g. "XAI_API_KEY=" in unit tests),
+// it respects the override and does not fall back to external config.
+func grokResolveAPIKey(childEnv []string, model string) string {
+	if val, ok := envLookup(childEnv, "XAI_API_KEY"); ok {
+		return strings.TrimSpace(val)
+	}
+	if envVal := strings.TrimSpace(os.Getenv("XAI_API_KEY")); envVal != "" {
+		return envVal
+	}
+	return grokConfigAPIKey(model)
 }

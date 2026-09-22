@@ -964,3 +964,59 @@ func grokMustFindModel(t *testing.T, models []Model, id string) Model {
 	t.Fatalf("model %q not in catalog: %+v", id, models)
 	return Model{}
 }
+
+func TestGrokUsesConfigTomlAPIKeyWhenNoCachedToken(t *testing.T) {
+	tempDir := t.TempDir()
+	grokHome := filepath.Join(tempDir, ".grok")
+	if err := os.MkdirAll(grokHome, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configContent := `
+[models]
+default = "grok-4.7"
+
+[model."grok-4.7"]
+api_key = "test-config-key"
+`
+	if err := os.WriteFile(filepath.Join(grokHome, "config.toml"), []byte(configContent), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	requestsFile := filepath.Join(tempDir, "requests.jsonl")
+	fakePath := filepath.Join(tempDir, "grok")
+	writeTestExecutable(t, fakePath, []byte(fakeGrokACPScript()))
+
+	backend, err := New("grok", Config{
+		ExecutablePath: fakePath,
+		Logger:         slog.Default(),
+		Env: map[string]string{
+			"GROK_HOME":          grokHome,
+			"GROK_AUTH_METHODS":  "api",
+			"GROK_REQUESTS_FILE": requestsFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("new grok backend: %v", err)
+	}
+	session, err := backend.Execute(context.Background(), "task", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+	result := <-session.Result
+	if result.Status != "completed" {
+		t.Fatalf("expected completed status, got: %s (err: %s)", result.Status, result.Error)
+	}
+
+	raw, err := os.ReadFile(requestsFile)
+	if err != nil {
+		t.Fatalf("read requests: %v", err)
+	}
+	if !strings.Contains(string(raw), `"methodId":"xai.api_key"`) {
+		t.Fatalf("expected authenticate with xai.api_key from config.toml, got requests:\n%s", raw)
+	}
+}
+
