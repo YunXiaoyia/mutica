@@ -88,6 +88,13 @@ import type {
   User,
   WebhookDelivery,
   WorkspaceMcpServer,
+  AdvancePipelineResponse,
+  InstantiatePipelineResponse,
+  IssueDependenciesResponse,
+  IssueDependencyItem,
+  PipelineRunChild,
+  PipelineTemplate,
+  PipelineTemplateStage,
 } from "../types";
 import type { CloudRuntimeNode } from "../runtimes/cloud-runtime";
 import type { CreateFeedbackResponse } from "../feedback/types";
@@ -3474,4 +3481,112 @@ export const EMPTY_JOIN_SHARE_LINK_RESPONSE: {
   },
   workspace_id: "",
   workspace_slug: "",
+};
+
+export const PipelineTemplateStageSchema = z.object({
+  id: z.string(),
+  stage_order: z.number(),
+  name: z.string(),
+  agent_id: z.string(),
+  skill_ids: z.array(z.string()).default([]),
+  prompt_template: z.string().default(""),
+  acceptance_criteria: z.string().default(""),
+  advance_mode: z.string(),
+  requires_human_gate: z.boolean().default(false),
+}).loose();
+
+export const EMPTY_PIPELINE_TEMPLATE_STAGE: PipelineTemplateStage = {
+  id: "",
+  stage_order: 1,
+  name: "",
+  agent_id: "",
+  skill_ids: [],
+  prompt_template: "",
+  acceptance_criteria: "",
+  advance_mode: "auto",
+  requires_human_gate: false,
+};
+
+export const PipelineTemplateSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string().default(""),
+  name: z.string(),
+  version: z.number(),
+  description: z.string().default(""),
+  orchestrator_agent_id: z.string().default(""),
+  stages: z.array(PipelineTemplateStageSchema).default([]),
+}).loose();
+
+export const EMPTY_PIPELINE_TEMPLATE: PipelineTemplate = {
+  id: "",
+  workspace_id: "",
+  name: "",
+  version: 0,
+  description: "",
+  orchestrator_agent_id: "",
+  stages: [],
+};
+
+export const PipelineTemplateListSchema = z.array(PipelineTemplateSchema);
+
+export const EMPTY_PIPELINE_TEMPLATE_LIST: PipelineTemplate[] = [];
+
+export const PipelineRunChildSchema = z.object({
+  issue_id: z.string(),
+  stage_order: z.number(),
+  name: z.string(),
+  agent_id: z.string(),
+  status: z.string(),
+  advance_mode: z.string(),
+}).loose();
+
+export const EMPTY_PIPELINE_RUN_CHILD: PipelineRunChild = {
+  issue_id: "",
+  stage_order: 1,
+  name: "",
+  agent_id: "",
+  status: "",
+  advance_mode: "auto",
+};
+
+export const InstantiatePipelineResponseSchema = z.object({
+  root_issue_id: z.string().default(""),
+  children: z.array(PipelineRunChildSchema).default([]),
+}).loose();
+
+export const EMPTY_INSTANTIATE_PIPELINE_RESPONSE: InstantiatePipelineResponse = {
+  root_issue_id: "",
+  children: [],
+};
+
+export const AdvancePipelineResponseSchema = z.object({
+  promoted: z.number(),
+}).loose();
+
+export const EMPTY_ADVANCE_PIPELINE_RESPONSE: AdvancePipelineResponse = {
+  promoted: 0,
+};
+
+export const IssueDependencyItemSchema = z.object({
+  issue_id: z.string(),
+  title: z.string().default(""),
+  status: z.string(),
+  resolved: z.boolean().default(false),
+}).loose();
+
+export const EMPTY_ISSUE_DEPENDENCY_ITEM: IssueDependencyItem = {
+  issue_id: "",
+  title: "",
+  status: "",
+  resolved: false,
+};
+
+export const IssueDependenciesResponseSchema = z.object({
+  blocked_by: z.array(IssueDependencyItemSchema).default([]),
+  blocks: z.array(IssueDependencyItemSchema).default([]),
+}).loose();
+
+export const EMPTY_ISSUE_DEPENDENCIES_RESPONSE: IssueDependenciesResponse = {
+  blocked_by: [],
+  blocks: [],
 };

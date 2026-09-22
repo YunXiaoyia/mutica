@@ -279,6 +279,19 @@ export type {
   ListWebhookDeliveriesResponse,
 } from "./autopilot";
 export type {
+  PipelineTemplateStage,
+  PipelineTemplate,
+  PipelineRunChild,
+  InstantiatePipelineResponse,
+  AdvancePipelineResponse,
+  IssueDependencyItem,
+  IssueDependenciesResponse,
+  CreatePipelineTemplateRequest,
+  UpdatePipelineTemplateRequest,
+  InstantiatePipelineRequest,
+  AdvancePipelineRequest,
+} from "./pipeline";
+export type {
   Squad,
   SquadMember,
   SquadMemberType,

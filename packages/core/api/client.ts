@@ -223,6 +223,13 @@ import type {
   CreateCommentSubIssueManualRequest,
   CreateCommentSubIssueAgentRequest,
   CreateCommentSubIssueRequest,
+  PipelineTemplate,
+  InstantiatePipelineResponse,
+  AdvancePipelineResponse,
+  IssueDependenciesResponse,
+  CreatePipelineTemplateRequest,
+  InstantiatePipelineRequest,
+  AdvancePipelineRequest,
 } from "../types";
 import type { OnboardingCompletionPath } from "../onboarding/types";
 import type {
@@ -457,6 +464,16 @@ import {
   EMPTY_SHARE_LINK,
   EMPTY_SHARE_LINK_INFO,
   EMPTY_JOIN_SHARE_LINK_RESPONSE,
+  PipelineTemplateListSchema,
+  EMPTY_PIPELINE_TEMPLATE_LIST,
+  PipelineTemplateSchema,
+  EMPTY_PIPELINE_TEMPLATE,
+  InstantiatePipelineResponseSchema,
+  EMPTY_INSTANTIATE_PIPELINE_RESPONSE,
+  AdvancePipelineResponseSchema,
+  EMPTY_ADVANCE_PIPELINE_RESPONSE,
+  IssueDependenciesResponseSchema,
+  EMPTY_ISSUE_DEPENDENCIES_RESPONSE,
   type IssueView,
   type IssueViewPreference,
   type CreateIssueViewRequest,
@@ -4314,6 +4331,84 @@ export class ApiClient {
     return parseWithFallback(raw, SquadMemberStatusListResponseSchema, EMPTY_SQUAD_MEMBER_STATUS_LIST, {
       endpoint: "GET /api/squads/:id/members/status",
     }) as SquadMemberStatusListResponse;
+  }
+
+  // Pipelines
+  async listPipelineTemplates(): Promise<PipelineTemplate[]> {
+    const raw = await this.fetch<unknown>("/api/pipeline-templates");
+    return parseWithFallback(
+      raw,
+      PipelineTemplateListSchema,
+      EMPTY_PIPELINE_TEMPLATE_LIST,
+      { endpoint: "GET /api/pipeline-templates" },
+    );
+  }
+
+  async getPipelineTemplate(id: string): Promise<PipelineTemplate> {
+    const raw = await this.fetch<unknown>(`/api/pipeline-templates/${id}`);
+    return parseWithFallback(
+      raw,
+      PipelineTemplateSchema,
+      EMPTY_PIPELINE_TEMPLATE,
+      { endpoint: "GET /api/pipeline-templates/{id}" },
+    );
+  }
+
+  async createPipelineTemplate(
+    data: CreatePipelineTemplateRequest,
+  ): Promise<PipelineTemplate> {
+    const raw = await this.fetch<unknown>("/api/pipeline-templates", {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+    return parseWithFallback(
+      raw,
+      PipelineTemplateSchema,
+      EMPTY_PIPELINE_TEMPLATE,
+      { endpoint: "POST /api/pipeline-templates" },
+    );
+  }
+
+  async instantiatePipelineTemplate(
+    id: string,
+    data: InstantiatePipelineRequest,
+  ): Promise<InstantiatePipelineResponse> {
+    const raw = await this.fetch<unknown>(`/api/pipeline-templates/${id}/instantiate`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+    return parseWithFallback(
+      raw,
+      InstantiatePipelineResponseSchema,
+      EMPTY_INSTANTIATE_PIPELINE_RESPONSE,
+      { endpoint: "POST /api/pipeline-templates/{id}/instantiate" },
+    );
+  }
+
+  async advancePipelineRun(
+    rootId: string,
+    data: AdvancePipelineRequest,
+  ): Promise<AdvancePipelineResponse> {
+    const raw = await this.fetch<unknown>(`/api/pipeline-runs/${rootId}/advance`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+    return parseWithFallback(
+      raw,
+      AdvancePipelineResponseSchema,
+      EMPTY_ADVANCE_PIPELINE_RESPONSE,
+      { endpoint: "POST /api/pipeline-runs/{rootId}/advance" },
+    );
+  }
+
+  async listIssueDependencies(issueId: string): Promise<IssueDependenciesResponse> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/dependencies`);
+    return parseWithFallback(
+      raw,
+      IssueDependenciesResponseSchema,
+      EMPTY_ISSUE_DEPENDENCIES_RESPONSE,
+      { endpoint: "GET /api/issues/{id}/dependencies" },
+    );
   }
 
   // Autopilots

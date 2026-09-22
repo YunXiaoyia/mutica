@@ -1442,3 +1442,131 @@ describe("workspace subscription contract", () => {
     );
   });
 });
+
+describe("pipeline endpoints", () => {
+  it("falls back to an empty array when listPipelineTemplates receives an object instead of an array", async () => {
+    stubFetchJson({ templates: [] });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.listPipelineTemplates();
+    expect(res).toEqual([]);
+  });
+
+  it("defaults stages and description when omitted while preserving id and name", async () => {
+    stubFetchJson([
+      {
+        id: "tpl-1",
+        workspace_id: "ws-1",
+        name: "Paper Pipeline",
+        version: 1,
+        orchestrator_agent_id: "agent-1",
+      },
+    ]);
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.listPipelineTemplates();
+    expect(res).toHaveLength(1);
+    expect(res[0]?.id).toBe("tpl-1");
+    expect(res[0]?.name).toBe("Paper Pipeline");
+    expect(res[0]?.stages).toEqual([]);
+    expect(res[0]?.description).toBe("");
+  });
+
+  it("accepts a future advance_mode without falling back to an empty list", async () => {
+    stubFetchJson([
+      {
+        id: "tpl-1",
+        workspace_id: "ws-1",
+        name: "Paper Pipeline",
+        version: 1,
+        description: "",
+        orchestrator_agent_id: "agent-1",
+        stages: [
+          {
+            id: "stage-1",
+            stage_order: 1,
+            name: "Stage 1",
+            agent_id: "agent-1",
+            skill_ids: [],
+            prompt_template: "",
+            acceptance_criteria: "",
+            advance_mode: "some_future_mode",
+            requires_human_gate: false,
+          },
+        ],
+      },
+    ]);
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.listPipelineTemplates();
+    expect(res).toHaveLength(1);
+    expect(res[0]?.stages[0]?.advance_mode).toBe("some_future_mode");
+  });
+
+  it("returns EMPTY_PIPELINE_TEMPLATE shape when getPipelineTemplate receives a malformed response", async () => {
+    stubFetchJson({ wrong: "shape" });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.getPipelineTemplate("tpl-1");
+    expect(res).toEqual({
+      id: "",
+      workspace_id: "",
+      name: "",
+      version: 0,
+      description: "",
+      orchestrator_agent_id: "",
+      stages: [],
+    });
+    expect(res.id).toBe("");
+    expect(res.stages).toEqual([]);
+  });
+
+  it("preserves root_issue_id and defaults children to empty array when omitted", async () => {
+    stubFetchJson({ root_issue_id: "root-1" });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.instantiatePipelineTemplate("tpl-1", {});
+    expect(res).toEqual({
+      root_issue_id: "root-1",
+      children: [],
+    });
+  });
+
+  it("falls back to empty shape when instantiatePipelineTemplate receives malformed children", async () => {
+    stubFetchJson({ children: "nope" });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.instantiatePipelineTemplate("tpl-1", {});
+    expect(res).toEqual({
+      root_issue_id: "",
+      children: [],
+    });
+  });
+
+  it("falls back to promoted: 0 when advancePipelineRun receives a non-number promoted field", async () => {
+    stubFetchJson({ promoted: "two" });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.advancePipelineRun("root-1", { stage: 1 });
+    expect(res).toEqual({ promoted: 0 });
+  });
+
+  it("falls back to empty dependencies shape when blocked_by is malformed", async () => {
+    stubFetchJson({ blocked_by: "nope" });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.listIssueDependencies("issue-1");
+    expect(res).toEqual({
+      blocked_by: [],
+      blocks: [],
+    });
+  });
+
+  it("preserves blocked_by entries and defaults blocks to empty array when omitted", async () => {
+    const item = {
+      issue_id: "blocker-1",
+      title: "Blocker Issue",
+      status: "todo",
+      resolved: false,
+    };
+    stubFetchJson({ blocked_by: [item] });
+    const client = new ApiClient("https://api.example.test");
+    const res = await client.listIssueDependencies("issue-1");
+    expect(res).toEqual({
+      blocked_by: [item],
+      blocks: [],
+    });
+  });
+});
